@@ -26,7 +26,6 @@ def panic(msg: str, etype: Type[Exception] = ValueError) -> NoReturn:
     raise etype(msg)
 
 # Int Enums instead of global variables
-
 class AdbCompressionWay(IntEnum):
     NONE = 0x2e # .
     DEFLATE = 0x64 # d
@@ -132,7 +131,10 @@ class CAdbDataPackage(LittleEndianStructure):
                 ("file_idx", Cu32))
 
 # Cached size constants for hot-path parsing
+SZ_CU8 = ctypes.sizeof(Cu8)
+SZ_CU16 = ctypes.sizeof(Cu16)
 SZ_CU32 = ctypes.sizeof(Cu32)
+SZ_CU64 = ctypes.sizeof(Cu64)
 SZ_CADB_SCHEMA = ctypes.sizeof(CAdbSchema)
 SZ_CADB_BLOCK = ctypes.sizeof(CAdbBlock)
 SZ_CADB_HDR = ctypes.sizeof(CAdbHdr)
@@ -189,7 +191,7 @@ class AdbReader:
         return v & self.VAL_DATA_MASK
 
     def _u16(self, off: int) -> int:
-        if off + ctypes.sizeof(Cu16) > len(self.adb):
+        if off + SZ_CU16 > len(self.adb):
             panic(f"Truncated u16 at offset {off}", FormatError)
         return Cu16.from_buffer_copy(self.adb, off).value
 
@@ -199,7 +201,7 @@ class AdbReader:
         return Cu32.from_buffer_copy(self.adb, off).value
 
     def _u64(self, off: int) -> int:
-        if off + ctypes.sizeof(Cu64) > len(self.adb):
+        if off + SZ_CU64 > len(self.adb):
             panic(f"Truncated u64 at offset {off}", FormatError)
         return Cu64.from_buffer_copy(self.adb, off).value
 
