@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ctypes
+from ctypes import LittleEndianStructure
 from compression import zstd
 from contextlib import ExitStack
 from enum import IntEnum
@@ -24,6 +25,13 @@ def panic(msg: str, etype: Type[Exception] = ValueError) -> NoReturn:
     logger.fatal(msg)
     raise etype(msg)
 
+# Int Enums instead of global variables
+
+class AdbCompressionWay(IntEnum):
+    NONE = 0x2e # .
+    DEFLATE = 0x64 # d
+    CUSTOM = 0x63 # c
+
 class AdbCompressionAlg(IntEnum):
     NONE = 0
     DEFLATE = 1
@@ -38,44 +46,6 @@ class AdbBlockType(IntEnum):
     SIG = 1
     DATA = 2
     EXT = 3
-
-# C type aliases
-Cu8 = ctypes.c_uint8
-Cu16 = ctypes.c_uint16
-Cu32 = ctypes.c_uint32
-Cu64 = ctypes.c_uint64
-CAdbSchema = Cu32
-
-class CAdbCompressionSpec(ctypes.LittleEndianStructure):
-    _fields_ = (("alg",   Cu8),
-                ("level", Cu8))
-
-class CAdbBlock(ctypes.LittleEndianStructure):
-    _fields_ = (("type_size", Cu32),
-                ("reserved", Cu32),
-                ("x_size", Cu64))
-
-class CAdbHdr(ctypes.LittleEndianStructure):
-    _fields_ = (("adb_compat_ver", Cu8),
-                ("adb_ver", Cu8),
-                ("reserved", Cu16),
-                ("root", Cu32))
-
-class CAdbSignHdr(ctypes.LittleEndianStructure):
-    _fields_ = (("sign_ver", Cu8),
-                ("hash_alg", Cu8))
-
-class CAdbDataPackage(ctypes.LittleEndianStructure):
-    _fields_ = (("path_idx", Cu32),
-                ("file_idx", Cu32))
-
-# Cached size constants for hot-path parsing
-SZ_CU32 = ctypes.sizeof(Cu32)
-SZ_CADB_SCHEMA = ctypes.sizeof(CAdbSchema)
-SZ_CADB_BLOCK = ctypes.sizeof(CAdbBlock)
-SZ_CADB_HDR = ctypes.sizeof(CAdbHdr)
-SZ_CADB_SIGN_HDR = ctypes.sizeof(CAdbSignHdr)
-SZ_CADB_DATA_PACKAGE = ctypes.sizeof(CAdbDataPackage)
 
 class AdbValType(IntEnum):
     SPECIAL = 0x00000000
@@ -130,6 +100,44 @@ class ApkVersionFlag(IntEnum):
     GREATER = 4
     FUZZY = 8
     CONFLICT = 16
+
+# C type aliases
+Cu8 = ctypes.c_uint8
+Cu16 = ctypes.c_uint16
+Cu32 = ctypes.c_uint32
+Cu64 = ctypes.c_uint64
+CAdbSchema = Cu32
+
+class CAdbCompressionSpec(LittleEndianStructure):
+    _fields_ = (("alg",   Cu8),
+                ("level", Cu8))
+
+class CAdbBlock(LittleEndianStructure):
+    _fields_ = (("type_size", Cu32),
+                ("reserved", Cu32),
+                ("x_size", Cu64))
+
+class CAdbHdr(LittleEndianStructure):
+    _fields_ = (("adb_compat_ver", Cu8),
+                ("adb_ver", Cu8),
+                ("reserved", Cu16),
+                ("root", Cu32))
+
+class CAdbSignHdr(LittleEndianStructure):
+    _fields_ = (("sign_ver", Cu8),
+                ("hash_alg", Cu8))
+
+class CAdbDataPackage(LittleEndianStructure):
+    _fields_ = (("path_idx", Cu32),
+                ("file_idx", Cu32))
+
+# Cached size constants for hot-path parsing
+SZ_CU32 = ctypes.sizeof(Cu32)
+SZ_CADB_SCHEMA = ctypes.sizeof(CAdbSchema)
+SZ_CADB_BLOCK = ctypes.sizeof(CAdbBlock)
+SZ_CADB_HDR = ctypes.sizeof(CAdbHdr)
+SZ_CADB_SIGN_HDR = ctypes.sizeof(CAdbSignHdr)
+SZ_CADB_DATA_PACKAGE = ctypes.sizeof(CAdbDataPackage)
 
 class AdbReader:
     VAL_TYPE_MASK = 0xF0000000
@@ -647,10 +655,10 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
         if mm[0:3] != b"ADB":
             panic("File is not an APK", FormatError)
         match mm[3]:
-            case 0x2e: # .: None
+            case AdbCompressionWay.NONE:
                 body = mm
                 offset = 4
-            case 0x64: # d: Deflate
+            case AdbCompressionWay.DEFLATE:
                 body = zlib.decompress(mm[4:], wbits=-15)
                 if body[0:3] != b"ADB":
                     panic("Inner deflate stream is not an APK", FormatError)
@@ -658,7 +666,7 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
                 stack.close()
                 del mm
                 del f
-            case 0x63: # c: APK-defined
+            case AdbCompressionWay.CUSTOM:
                 spec = CAdbCompressionSpec.from_buffer_copy(mm, 4)
                 match spec.alg:
                     case AdbCompressionAlg.NONE:
