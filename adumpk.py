@@ -100,6 +100,56 @@ class ApkVersionFlag(IntEnum):
     FUZZY = 8
     CONFLICT = 16
 
+class AdbPkgInfoType(IntEnum):
+    NAME = 1
+    VERSION = 2
+    HASHES = 3
+    DESCRIPTION =4
+    ARCH = 5
+    LICENSE= 6
+    ORIGIN = 7
+    MAINTAINER = 8
+    URL = 9
+    REPO_COMMIT = 10
+    BUILD_TIME = 11
+    INSTALLED_SIZE = 12
+    FILE_SIZE = 13
+    PROVIDER_PRIORITY = 14
+    DEPENDS = 15
+    PROVIDES = 16
+    REPLACES = 17
+    INSTALL_IF = 18
+    RECOMMENDS = 19
+    LAYER = 20
+    TAGS = 21
+
+    def __str__(self) -> str:
+        if self < self.NAME or self > self.TAGS:
+            panic(f"Invalid enum type {int(self)}", ValueError)
+        return (
+            "name",
+            "version",
+            "hashes",
+            "description",
+            "arch",
+            "license",
+            "origin",
+            "maintainer",
+            "url",
+            "repo-commit",
+            "build-time",
+            "installed-size",
+            "file-size",
+            "provider-priority",
+            "depends",
+            "provides",
+            "replaces",
+            "install-if",
+            "recommends",
+            "layer",
+            "tags",
+        )[self - 1]
+
 # C type aliases
 Cu8 = ctypes.c_uint8
 Cu16 = ctypes.c_uint16
@@ -144,29 +194,6 @@ SZ_CADB_DATA_PACKAGE = ctypes.sizeof(CAdbDataPackage)
 class AdbReader:
     VAL_TYPE_MASK = 0xF0000000
     VAL_DATA_MASK = 0x0FFFFFFF
-    PKGINFO_NAMES = {
-        1: "name",
-        2: "version",
-        3: "hashes",
-        4: "description",
-        5: "arch",
-        6: "license",
-        7: "origin",
-        8: "maintainer",
-        9: "url",
-        10: "repo-commit",
-        11: "build-time",
-        12: "installed-size",
-        13: "file-size",
-        14: "provider-priority",
-        15: "depends",
-        16: "provides",
-        17: "replaces",
-        18: "install-if",
-        19: "recommends",
-        20: "layer",
-        21: "tags",
-    }
     PKGINFO_DEP_FIELDS = {
         int(AdbPkgInfoField.DEPENDS),
         int(AdbPkgInfoField.PROVIDES),
@@ -330,7 +357,7 @@ class AdbReader:
             tag = obj[idx]
             if tag == 0:
                 continue
-            name = self.PKGINFO_NAMES.get(idx, f"field-{idx}")
+            name = str(AdbPkgInfoType(idx))
             if idx in self.PKGINFO_DEP_FIELDS:
                 meta[name] = self.parse_dep_array(tag)
                 continue
