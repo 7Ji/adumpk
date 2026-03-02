@@ -13,7 +13,7 @@ from pathlib import PosixPath as Path
 import stat
 import sys
 import tarfile
-from typing import NoReturn, Optional, Type
+from typing import Literal, NoReturn, Optional, Type, TypedDict
 import zlib
 
 logger = logging.getLogger(__name__)
@@ -191,6 +191,37 @@ SZ_CADB_HDR = ctypes.sizeof(CAdbHdr)
 SZ_CADB_SIGN_HDR = ctypes.sizeof(CAdbSignHdr)
 SZ_CADB_DATA_PACKAGE = ctypes.sizeof(CAdbDataPackage)
 
+PkgMetaValue = int | str | list[str]
+PackageMetadata = dict[str, PkgMetaValue]
+FileKind = Literal["file", "symlink", "hardlink", "special", "unknown"]
+
+class DirectoryEntry(TypedDict):
+    path: str
+    mode: int
+    user: Optional[str]
+    group: Optional[str]
+    path_idx: int
+
+class FileEntry(TypedDict):
+    path: str
+    name: str
+    path_idx: int
+    file_idx: int
+    kind: FileKind
+    size: int
+    mtime: int
+    mode: int
+    user: Optional[str]
+    group: Optional[str]
+    link_target: Optional[str]
+    device: Optional[int]
+
+class PackageSchemaMeta(TypedDict):
+    schema: Literal["package"]
+    metadata: PackageMetadata
+    dirs: list[DirectoryEntry]
+    files: list[FileEntry]
+
 class AdbReader:
     VAL_TYPE_MASK = 0xF0000000
     VAL_DATA_MASK = 0x0FFFFFFF
@@ -350,8 +381,8 @@ class AdbReader:
                 out.append(text)
         return out
 
-    def parse_pkginfo(self, pkginfo_tag: int) -> dict[str, object]:
-        meta = {}
+    def parse_pkginfo(self, pkginfo_tag: int) -> PackageMetadata:
+        meta: PackageMetadata = {}
         obj = self.read_obj(pkginfo_tag)
         for idx in range(1, len(obj)):
             tag = obj[idx]
@@ -374,7 +405,9 @@ class AdbReader:
             if idx in self.PKGINFO_HEX_FIELDS:
                 meta[name] = blob.hex()
             else:
-                meta[name] = self.blob_to_text(blob)
+                text = self.blob_to_text(blob)
+                if text is not None:
+                    meta[name] = text
         return meta
 
     def _parse_acl(self, acl_tag: int, default_mode: int) -> tuple[int, Optional[str], Optional[str]]:
@@ -387,7 +420,7 @@ class AdbReader:
         return (default_mode if mode is None else int(mode)), user, group
 
     @staticmethod
-    def _parse_target_blob(target: Optional[bytes]) -> tuple[str, Optional[str], Optional[int]]:
+    def _parse_target_blob(target: Optional[bytes]) -> tuple[FileKind, Optional[str], Optional[int]]:
         if not target:
             return "file", None, None
         if len(target) < 2:
@@ -411,20 +444,20 @@ class AdbReader:
             return "special", None, int.from_bytes(payload, "little")
         return "unknown", None, None
 
-    def parse_package(self) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]], dict[tuple[int, int], dict[str, object]]]:
+    def parse_package(self) -> tuple[PackageMetadata, list[DirectoryEntry], list[FileEntry], dict[tuple[int, int], FileEntry]]:
         if len(self.adb) < SZ_CADB_HDR:
             panic("ADB payload too small for header", FormatError)
         hdr = CAdbHdr.from_buffer_copy(self.adb, 0)
         pkg = self.read_obj(hdr.root)
 
-        metadata = {}
+        metadata: PackageMetadata = {}
         pkginfo_tag = self.obj_get(pkg, AdbPkgField.PKGINFO)
         if pkginfo_tag != 0:
             metadata = self.parse_pkginfo(pkginfo_tag)
 
-        dirs = []
-        file_entries = []
-        file_lookup = {}
+        dirs: list[DirectoryEntry] = []
+        file_entries: list[FileEntry] = []
+        file_lookup: dict[tuple[int, int], FileEntry] = {}
         paths_tag = self.obj_get(pkg, AdbPkgField.PATHS)
         if paths_tag == 0:
             return metadata, dirs, file_entries, file_lookup
@@ -462,7 +495,7 @@ class AdbReader:
                 fmtime = self.read_int(self.obj_get(file_obj, AdbFileField.MTIME))
                 target_blob = self.read_blob(self.obj_get(file_obj, AdbFileField.TARGET))
                 fkind, flink, fdev = self._parse_target_blob(target_blob)
-                info = {
+                info: FileEntry = {
                     "path": full,
                     "name": file_name,
                     "path_idx": path_idx,
@@ -499,44 +532,44 @@ def _tar_add_parent_dirs(tar: tarfile.TarFile, path: str, seen_dirs: set[str]):
         tar.addfile(ti)
         seen_dirs.add(current)
 
-def _tar_add_dir(tar: tarfile.TarFile, d: dict[str, object], seen_dirs: set[str]):
-    path = str(d["path"])
+def _tar_add_dir(tar: tarfile.TarFile, d: DirectoryEntry, seen_dirs: set[str]):
+    path = d["path"]
     if not path or path in seen_dirs:
         return
     _tar_add_parent_dirs(tar, path, seen_dirs)
-    ti = _tarinfo_base(f"{path}/", int(d["mode"]), 0)
+    ti = _tarinfo_base(f"{path}/", d["mode"], 0)
     ti.type = tarfile.DIRTYPE
     ti.size = 0
     tar.addfile(ti)
     seen_dirs.add(path)
 
-def _tar_add_nondata_file(tar: tarfile.TarFile, f: dict[str, object], seen_dirs: set[str]):
-    kind = str(f["kind"])
-    path = str(f["path"])
+def _tar_add_nondata_file(tar: tarfile.TarFile, f: FileEntry, seen_dirs: set[str]):
+    kind = f["kind"]
+    path = f["path"]
     _tar_add_parent_dirs(tar, path, seen_dirs)
-    if kind == "file" and int(f["size"]) == 0:
-        ti = _tarinfo_base(path, int(f["mode"]), int(f["mtime"]))
+    if kind == "file" and f["size"] == 0:
+        ti = _tarinfo_base(path, f["mode"], f["mtime"])
         ti.size = 0
         tar.addfile(ti, io.BytesIO())
         return
     if kind == "symlink":
-        ti = _tarinfo_base(path, int(f["mode"]), int(f["mtime"]))
+        ti = _tarinfo_base(path, f["mode"], f["mtime"])
         ti.type = tarfile.SYMTYPE
-        ti.linkname = str(f["link_target"] or "")
+        ti.linkname = f["link_target"] or ""
         ti.size = 0
         tar.addfile(ti)
         return
     if kind == "hardlink":
-        ti = _tarinfo_base(path, int(f["mode"]), int(f["mtime"]))
+        ti = _tarinfo_base(path, f["mode"], f["mtime"])
         ti.type = tarfile.LNKTYPE
-        ti.linkname = str(f["link_target"] or "")
+        ti.linkname = f["link_target"] or ""
         ti.size = 0
         tar.addfile(ti)
 
-def _tar_add_data_file(tar: tarfile.TarFile, f: dict[str, object], payload: bytes, seen_dirs: set[str]):
-    path = str(f["path"])
+def _tar_add_data_file(tar: tarfile.TarFile, f: FileEntry, payload: bytes, seen_dirs: set[str]):
+    path = f["path"]
     _tar_add_parent_dirs(tar, path, seen_dirs)
-    ti = _tarinfo_base(path, int(f["mode"]), int(f["mtime"]))
+    ti = _tarinfo_base(path, f["mode"], f["mtime"])
     ti.size = len(payload)
     tar.addfile(ti, io.BytesIO(payload))
 
@@ -569,10 +602,10 @@ def _parse_block(buf, offset: int, limit: int) -> tuple[int, int, int, int]:
 
     return block_type, hdr_size, raw_size - hdr_size, next_offset
 
-def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile, meta_schemas: list[dict[str, object]]) -> int:
+def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]) -> int:
     seen_adb = False
     seen_data = False
-    file_lookup: dict[tuple[int, int], dict[str, object]] = {}
+    file_lookup: dict[tuple[int, int], FileEntry] = {}
     written_data: set[tuple[int, int]] = set()
     seen_dirs: set[str] = set()
     index = 0
@@ -647,10 +680,10 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
                         panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
                     written_data.add(key)
 
-                    if str(file_info["kind"]) != "file":
+                    if file_info["kind"] != "file":
                         panic(f"DATA block points to non-regular file '{file_info['path']}'", FormatError)
                     payload = bytes(buf[payload_off + SZ_CADB_DATA_PACKAGE:payload_off + payload_size])
-                    if len(payload) != int(file_info["size"]):
+                    if len(payload) != file_info["size"]:
                         panic(
                             f"DATA size mismatch for '{file_info['path']}': {len(payload)} != {file_info['size']}",
                             FormatError,
@@ -730,8 +763,8 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
         )
 
         f_meta = stack.enter_context((path_meta or Path("/dev/null")).open("w"))
-        meta_schemas: list[dict[str, object]] = []
-        meta_doc: dict[str, object] = {
+        meta_schemas: list[PackageSchemaMeta] = []
+        meta_doc: dict[str, str | list[PackageSchemaMeta]] = {
             "apk": str(path_apk),
             "schemas": meta_schemas,
         }
