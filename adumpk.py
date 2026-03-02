@@ -9,6 +9,7 @@ from enum import IntEnum, StrEnum
 import io
 import json
 import logging
+import os
 from pathlib import PosixPath as Path
 import stat
 import sys
@@ -84,6 +85,7 @@ class AdbFileField(AdbField):
     ACL = 2
     SIZE = 3
     MTIME = 4
+    HASHES = 5
     TARGET = 6
 
 class AdbDepField(AdbField):
@@ -95,6 +97,7 @@ class AdbAclField(AdbField):
     MODE = 1
     USER = 2
     GROUP = 3
+    XATTRS = 4
 
 class ApkVersionFlag(IntEnum):
     EQUAL = 1
@@ -201,7 +204,9 @@ class FileKind(StrEnum):
     FILE = "file"
     SYMLINK = "symlink"
     HARDLINK = "hardlink"
-    SPECIAL = "special"
+    BLOCK = "block"
+    CHAR = "char"
+    FIFO = "fifo"
     UNKNOWN = "unknown"
 
 @dataclass
@@ -211,6 +216,13 @@ class DirectoryEntry:
     user: Optional[str]
     group: Optional[str]
     path_idx: int
+    xattrs: list["XattrEntry"] = field(default_factory=list)
+
+@dataclass
+class XattrEntry:
+    name: str
+    value_hex: str
+    value_text: Optional[str]
 
 @dataclass
 class FileEntry:
@@ -226,6 +238,9 @@ class FileEntry:
     group: Optional[str]
     link_target: Optional[str]
     device: Optional[int]
+    xattrs: list[XattrEntry] = field(default_factory=list)
+    hash_alg: Optional[str] = None
+    hash_hex: Optional[str] = None
 
 @dataclass
 class PackageSchemaMeta:
@@ -600,14 +615,53 @@ class AdbReader:
                     meta[name] = text
         return meta
 
-    def _parse_acl(self, acl_tag: int, default_mode: int) -> tuple[int, Optional[str], Optional[str]]:
+    def _parse_xattrs(self, xattr_tag: int) -> list[XattrEntry]:
+        if xattr_tag == 0:
+            return []
+        out: list[XattrEntry] = []
+        arr = self.read_obj(xattr_tag)
+        for i in range(1, len(arr)):
+            tag = arr[i]
+            if tag == 0:
+                continue
+            blob = self.read_blob(tag)
+            if blob is None:
+                continue
+            sep = blob.find(b"\x00")
+            if sep < 0:
+                panic("Invalid ACL xattr entry missing NUL separator", FormatError)
+            name_raw = blob[:sep]
+            value_raw = blob[sep + 1:]
+            name = self.blob_to_text(name_raw)
+            if name is None:
+                panic("Invalid ACL xattr name", FormatError)
+            out.append(XattrEntry(
+                name=name,
+                value_hex=value_raw.hex(),
+                value_text=self.blob_to_text(value_raw),
+            ))
+        return out
+
+    @staticmethod
+    def _parse_hash(hash_blob: Optional[bytes]) -> tuple[Optional[str], Optional[str]]:
+        if not hash_blob:
+            return None, None
+        alg = {
+            20: "SHA1",
+            32: "SHA256",
+            64: "SHA512",
+        }.get(len(hash_blob))
+        return alg, hash_blob.hex()
+
+    def _parse_acl(self, acl_tag: int, default_mode: int) -> tuple[int, Optional[str], Optional[str], list[XattrEntry]]:
         if acl_tag == 0:
-            return default_mode, None, None
+            return default_mode, None, None, []
         acl = self.read_obj(acl_tag)
         mode = self.read_int(self.obj_get(acl, AdbAclField.MODE))
         user = self.blob_to_text(self.read_blob(self.obj_get(acl, AdbAclField.USER)))
         group = self.blob_to_text(self.read_blob(self.obj_get(acl, AdbAclField.GROUP)))
-        return (default_mode if mode is None else int(mode)), user, group
+        xattrs = self._parse_xattrs(self.obj_get(acl, AdbAclField.XATTRS))
+        return (default_mode if mode is None else int(mode)), user, group, xattrs
 
     @staticmethod
     def _parse_target_blob(target: Optional[bytes]) -> tuple[FileKind, Optional[str], Optional[int]]:
@@ -629,10 +683,18 @@ class AdbReader:
                     return FileKind.HARDLINK, payload.decode("utf-8"), None
                 except UnicodeDecodeError:
                     return FileKind.HARDLINK, payload.decode("utf-8", errors="surrogateescape"), None
-            case stat.S_IFBLK | stat.S_IFCHR | stat.S_IFIFO:
+            case stat.S_IFBLK:
                 if len(payload) != 8:
                     panic("Invalid device/fifo target blob length", FormatError)
-                return FileKind.SPECIAL, None, int.from_bytes(payload, "little")
+                return FileKind.BLOCK, None, int.from_bytes(payload, "little")
+            case stat.S_IFCHR:
+                if len(payload) != 8:
+                    panic("Invalid device/fifo target blob length", FormatError)
+                return FileKind.CHAR, None, int.from_bytes(payload, "little")
+            case stat.S_IFIFO:
+                if len(payload) != 8:
+                    panic("Invalid device/fifo target blob length", FormatError)
+                return FileKind.FIFO, None, int.from_bytes(payload, "little")
             case _:
                 return FileKind.UNKNOWN, None, None
 
@@ -661,13 +723,14 @@ class AdbReader:
                 continue
             path = self.read_obj(path_tag)
             path_name = self.blob_to_text(self.read_blob(self.obj_get(path, AdbDirField.NAME))) or ""
-            dmode, duser, dgroup = self._parse_acl(self.obj_get(path, AdbDirField.ACL), 0o755)
+            dmode, duser, dgroup, dxattrs = self._parse_acl(self.obj_get(path, AdbDirField.ACL), 0o755)
             dirs.append(DirectoryEntry(
                 path=path_name,
                 mode=dmode,
                 user=duser,
                 group=dgroup,
                 path_idx=path_idx,
+                xattrs=dxattrs,
             ))
             files_tag = self.obj_get(path, AdbDirField.FILES)
             if files_tag == 0:
@@ -682,9 +745,10 @@ class AdbReader:
                 if file_name is None:
                     continue
                 full = f"{path_name}/{file_name}" if path_name else file_name
-                fmode, fuser, fgroup = self._parse_acl(self.obj_get(file_obj, AdbFileField.ACL), 0o644)
+                fmode, fuser, fgroup, fxattrs = self._parse_acl(self.obj_get(file_obj, AdbFileField.ACL), 0o644)
                 fsize = self.read_int(self.obj_get(file_obj, AdbFileField.SIZE))
                 fmtime = self.read_int(self.obj_get(file_obj, AdbFileField.MTIME))
+                fhash_alg, fhash_hex = self._parse_hash(self.read_blob(self.obj_get(file_obj, AdbFileField.HASHES)))
                 target_blob = self.read_blob(self.obj_get(file_obj, AdbFileField.TARGET))
                 fkind, flink, fdev = self._parse_target_blob(target_blob)
                 info = FileEntry(
@@ -700,15 +764,35 @@ class AdbReader:
                     group=fgroup,
                     link_target=flink,
                     device=fdev,
+                    xattrs=fxattrs,
+                    hash_alg=fhash_alg,
+                    hash_hex=fhash_hex,
                 )
                 file_entries.append(info)
                 file_lookup[(path_idx, file_idx)] = info
         return metadata, dirs, file_entries, file_lookup
 
-def _tarinfo_base(name: str, mode: int, mtime: int) -> tarfile.TarInfo:
+def _tarinfo_base(
+    name: str,
+    mode: int,
+    mtime: int,
+    user: Optional[str] = None,
+    group: Optional[str] = None,
+    uid: int = 0,
+    gid: int = 0,
+    pax_headers: Optional[dict[str, str]] = None,
+) -> tarfile.TarInfo:
     ti = tarfile.TarInfo(name=name)
     ti.mode = mode & 0o7777
     ti.mtime = int(mtime)
+    ti.uid = int(uid)
+    ti.gid = int(gid)
+    if user:
+        ti.uname = user
+    if group:
+        ti.gname = group
+    if pax_headers:
+        ti.pax_headers = pax_headers
     return ti
 
 class _TarDataStream:
@@ -726,9 +810,65 @@ class _TarDataStream:
         return data
 
 class TarEmitter:
+    NOBODY_ID = 65534
+
     def __init__(self, tar: tarfile.TarFile):
         self.tar = tar
         self.seen_dirs: set[str] = set()
+        self._uid_cache: dict[Optional[str], int] = {}
+        self._gid_cache: dict[Optional[str], int] = {}
+
+    @staticmethod
+    def _safe_pax_component(name: str) -> str:
+        if all(0x20 <= ord(ch) <= 0x7E and ch not in "=\n" for ch in name):
+            return name
+        return f"hex:{name.encode('utf-8', errors='replace').hex()}"
+
+    def _resolve_uid(self, user: Optional[str]) -> int:
+        cached = self._uid_cache.get(user)
+        if cached is not None:
+            return cached
+        uid = self.NOBODY_ID
+        if user:
+            try:
+                uid = int(user, 10)
+            except ValueError:
+                if user == "root":
+                    uid = 0
+                elif user == "nobody":
+                    uid = self.NOBODY_ID
+        self._uid_cache[user] = uid
+        return uid
+
+    def _resolve_gid(self, group: Optional[str]) -> int:
+        cached = self._gid_cache.get(group)
+        if cached is not None:
+            return cached
+        gid = self.NOBODY_ID
+        if group:
+            try:
+                gid = int(group, 10)
+            except ValueError:
+                if group == "root":
+                    gid = 0
+                elif group == "nobody":
+                    gid = self.NOBODY_ID
+        self._gid_cache[group] = gid
+        return gid
+
+    def _build_pax_headers(
+        self,
+        xattrs: list[XattrEntry],
+        hash_alg: Optional[str] = None,
+        hash_hex: Optional[str] = None,
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for x in xattrs:
+            key = self._safe_pax_component(x.name)
+            headers[f"SCHILY.xattr.{key}"] = x.value_text if x.value_text is not None else f"hex:{x.value_hex}"
+        if hash_hex and hash_alg:
+            headers[f"APK-TOOLS.checksum.{hash_alg}"] = hash_hex
+        return headers
 
     def _add_parent_dirs(self, path: str):
         parts = Path(path).parts[:-1]
@@ -737,7 +877,7 @@ class TarEmitter:
             current = f"{current}/{part}" if current else part
             if current in self.seen_dirs:
                 continue
-            ti = _tarinfo_base(f"{current}/", 0o755, 0)
+            ti = _tarinfo_base(f"{current}/", 0o755, 0, user="root", group="root", uid=0, gid=0)
             ti.type = tarfile.DIRTYPE
             ti.size = 0
             self.tar.addfile(ti)
@@ -748,7 +888,16 @@ class TarEmitter:
         if not path or path in self.seen_dirs:
             return
         self._add_parent_dirs(path)
-        ti = _tarinfo_base(f"{path}/", d.mode, 0)
+        ti = _tarinfo_base(
+            f"{path}/",
+            d.mode,
+            0,
+            user=d.user,
+            group=d.group,
+            uid=self._resolve_uid(d.user),
+            gid=self._resolve_gid(d.group),
+            pax_headers=self._build_pax_headers(d.xattrs),
+        )
         ti.type = tarfile.DIRTYPE
         ti.size = 0
         self.tar.addfile(ti)
@@ -757,23 +906,105 @@ class TarEmitter:
     def add_nondata_file(self, f: FileEntry):
         kind = f.kind
         path = f.path
+        pax_headers = self._build_pax_headers(
+            f.xattrs,
+            hash_alg=f.hash_alg,
+            hash_hex=f.hash_hex,
+        )
         self._add_parent_dirs(path)
         match kind:
             case FileKind.FILE:
                 if f.size == 0:
-                    ti = _tarinfo_base(path, f.mode, f.mtime)
+                    ti = _tarinfo_base(
+                        path,
+                        f.mode,
+                        f.mtime,
+                        user=f.user,
+                        group=f.group,
+                        uid=self._resolve_uid(f.user),
+                        gid=self._resolve_gid(f.group),
+                        pax_headers=pax_headers,
+                    )
                     ti.size = 0
                     self.tar.addfile(ti, io.BytesIO())
             case FileKind.SYMLINK:
-                ti = _tarinfo_base(path, f.mode, f.mtime)
+                ti = _tarinfo_base(
+                    path,
+                    f.mode,
+                    f.mtime,
+                    user=f.user,
+                    group=f.group,
+                    uid=self._resolve_uid(f.user),
+                    gid=self._resolve_gid(f.group),
+                    pax_headers=pax_headers,
+                )
                 ti.type = tarfile.SYMTYPE
                 ti.linkname = f.link_target or ""
                 ti.size = 0
                 self.tar.addfile(ti)
             case FileKind.HARDLINK:
-                ti = _tarinfo_base(path, f.mode, f.mtime)
+                ti = _tarinfo_base(
+                    path,
+                    f.mode,
+                    f.mtime,
+                    user=f.user,
+                    group=f.group,
+                    uid=self._resolve_uid(f.user),
+                    gid=self._resolve_gid(f.group),
+                    pax_headers=pax_headers,
+                )
                 ti.type = tarfile.LNKTYPE
                 ti.linkname = f.link_target or ""
+                ti.size = 0
+                self.tar.addfile(ti)
+            case FileKind.BLOCK:
+                if f.device is None:
+                    panic(f"BLOCK file missing device number: '{path}'", FormatError)
+                ti = _tarinfo_base(
+                    path,
+                    f.mode,
+                    f.mtime,
+                    user=f.user,
+                    group=f.group,
+                    uid=self._resolve_uid(f.user),
+                    gid=self._resolve_gid(f.group),
+                    pax_headers=pax_headers,
+                )
+                ti.type = tarfile.BLKTYPE
+                ti.devmajor = os.major(f.device)
+                ti.devminor = os.minor(f.device)
+                ti.size = 0
+                self.tar.addfile(ti)
+            case FileKind.CHAR:
+                if f.device is None:
+                    panic(f"CHAR file missing device number: '{path}'", FormatError)
+                ti = _tarinfo_base(
+                    path,
+                    f.mode,
+                    f.mtime,
+                    user=f.user,
+                    group=f.group,
+                    uid=self._resolve_uid(f.user),
+                    gid=self._resolve_gid(f.group),
+                    pax_headers=pax_headers,
+                )
+                ti.type = tarfile.CHRTYPE
+                ti.devmajor = os.major(f.device)
+                ti.devminor = os.minor(f.device)
+                ti.size = 0
+                self.tar.addfile(ti)
+            case FileKind.FIFO:
+                ti = _tarinfo_base(
+                    path,
+                    f.mode,
+                    f.mtime,
+                    user=f.user,
+                    group=f.group,
+                    uid=self._resolve_uid(f.user),
+                    gid=self._resolve_gid(f.group),
+                    pax_headers=pax_headers,
+                )
+                ti.type = tarfile.FIFOTYPE
                 ti.size = 0
                 self.tar.addfile(ti)
             case _:
@@ -782,7 +1013,20 @@ class TarEmitter:
     def add_data_file_stream(self, f: FileEntry, data_len: int, stream: ApkByteStream):
         path = f.path
         self._add_parent_dirs(path)
-        ti = _tarinfo_base(path, f.mode, f.mtime)
+        ti = _tarinfo_base(
+            path,
+            f.mode,
+            f.mtime,
+            user=f.user,
+            group=f.group,
+            uid=self._resolve_uid(f.user),
+            gid=self._resolve_gid(f.group),
+            pax_headers=self._build_pax_headers(
+                f.xattrs,
+                hash_alg=f.hash_alg,
+                hash_hex=f.hash_hex,
+            ),
+        )
         ti.size = data_len
         self.tar.addfile(ti, _TarDataStream(stream, data_len))
 
