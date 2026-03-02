@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
+from abc import ABC, abstractmethod
 import argparse
 import ctypes
 from ctypes import LittleEndianStructure
 from compression import zstd
-from contextlib import ExitStack
 from enum import IntEnum
 import io
 import json
 import logging
-import mmap
 from pathlib import PosixPath as Path
 import stat
 import sys
 import tarfile
-from typing import Literal, NoReturn, Optional, Type, TypedDict
+import tempfile
+from typing import BinaryIO, Literal, NoReturn, Optional, Type, TypedDict
 import zlib
 
 logger = logging.getLogger(__name__)
@@ -221,6 +221,186 @@ class PackageSchemaMeta(TypedDict):
     metadata: PackageMetadata
     dirs: list[DirectoryEntry]
     files: list[FileEntry]
+
+class ApkByteStream(ABC):
+    @abstractmethod
+    def read(self, size: int) -> bytes:
+        raise NotImplementedError
+
+    def read_exact(self, size: int, what: str) -> bytes:
+        if size <= 0:
+            return b""
+        out = bytearray()
+        while len(out) < size:
+            chunk = self.read(size - len(out))
+            if not chunk:
+                panic(f"Truncated {what}", FormatError)
+            out.extend(chunk)
+        return bytes(out)
+
+    def read_exact_or_none(self, size: int, what: str) -> Optional[bytes]:
+        first = self.read(size)
+        if not first:
+            return None
+        if len(first) == size:
+            return first
+        out = bytearray(first)
+        while len(out) < size:
+            chunk = self.read(size - len(out))
+            if not chunk:
+                panic(f"Truncated {what}", FormatError)
+            out.extend(chunk)
+        return bytes(out)
+
+    def skip(self, size: int, what: str):
+        remaining = size
+        while remaining > 0:
+            chunk = self.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                panic(f"Truncated {what}", FormatError)
+            remaining -= len(chunk)
+
+    def close(self):
+        pass
+
+class RawApkByteStream(ApkByteStream):
+    def __init__(self, f: BinaryIO):
+        self._f = f
+
+    def read(self, size: int) -> bytes:
+        return self._f.read(size)
+
+class DeflateApkByteStream(ApkByteStream):
+    def __init__(self, f: BinaryIO):
+        self._f = f
+        self._dec = zlib.decompressobj(wbits=-15)
+        self._out = bytearray()
+        self._eof = False
+
+    def _fill(self, size: int):
+        while len(self._out) < size and not self._eof:
+            in_chunk = self._f.read(1024 * 1024)
+            if not in_chunk:
+                self._out.extend(self._dec.flush())
+                self._eof = True
+                break
+            self._out.extend(self._dec.decompress(in_chunk))
+
+    def read(self, size: int) -> bytes:
+        if size <= 0:
+            return b""
+        self._fill(size)
+        out = bytes(self._out[:size])
+        del self._out[:len(out)]
+        return out
+
+class ZstdApkByteStream(ApkByteStream):
+    def __init__(self, f: BinaryIO):
+        self._f = f
+        self._dec = zstd.ZstdDecompressor()
+        self._out = bytearray()
+        self._done = False
+
+    def _fill(self, size: int):
+        while len(self._out) < size and not self._done:
+            if self._dec.needs_input:
+                in_chunk = self._f.read(1024 * 1024)
+                if not in_chunk:
+                    panic("Truncated zstd stream", FormatError)
+            else:
+                in_chunk = b""
+
+            out_chunk = self._dec.decompress(in_chunk, max_length=1024 * 1024)
+            if out_chunk:
+                self._out.extend(out_chunk)
+            elif self._dec.needs_input and not in_chunk:
+                panic("Truncated zstd stream", FormatError)
+
+            if self._dec.eof:
+                self._done = True
+                break
+
+    def read(self, size: int) -> bytes:
+        if size <= 0:
+            return b""
+        self._fill(size)
+        out = bytes(self._out[:size])
+        del self._out[:len(out)]
+        return out
+
+class ApkBodySource:
+    def __init__(self, f: BinaryIO, stream: ApkByteStream):
+        self._f = f
+        self.stream = stream
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.stream.close()
+        self._f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    @staticmethod
+    def assert_head(head: bytes, what: str):
+        if head[0:3] != b"ADB":
+            panic(f"{what} is not an APK", FormatError)
+
+    @staticmethod
+    def assert_header(stream: ApkByteStream, what: str):
+        head = stream.read_exact(4, f"{what} header")
+        ApkBodySource.assert_head(head, what)
+
+    @classmethod
+    def open(cls, path_apk: Path) -> "ApkBodySource":
+        f = path_apk.open("rb")
+        try:
+            head = f.read(6)
+            if len(head) < 4:
+                panic("File too small, meanless to dump")
+            cls.assert_head(head, "File")
+
+            match head[3]:
+                case AdbCompressionWay.NONE:
+                    f.seek(4)
+                    return cls(f, RawApkByteStream(f))
+                case AdbCompressionWay.DEFLATE:
+                    f.seek(4)
+                    stream = DeflateApkByteStream(f)
+                    cls.assert_header(stream, "Inner deflate stream")
+                    return cls(f, stream)
+                case AdbCompressionWay.CUSTOM:
+                    if len(head) < 6:
+                        panic("Truncated custom compression spec", FormatError)
+                    spec = CAdbCompressionSpec.from_buffer_copy(head, 4)
+                    match spec.alg:
+                        case AdbCompressionAlg.NONE:
+                            f.seek(6)
+                            return cls(f, RawApkByteStream(f))
+                        case AdbCompressionAlg.DEFLATE:
+                            f.seek(6)
+                            stream = DeflateApkByteStream(f)
+                            cls.assert_header(stream, "Inner deflate stream")
+                            return cls(f, stream)
+                        case AdbCompressionAlg.ZSTD:
+                            f.seek(6)
+                            stream = ZstdApkByteStream(f)
+                            cls.assert_header(stream, "Inner zstd stream")
+                            return cls(f, stream)
+                        case _:
+                            panic(f"Invalid compression alg ID {spec.alg} (level {spec.level}) ", FormatError)
+                case _:
+                    panic(f"Invalid compression magic {head[3]:x}", FormatError)
+        except Exception:
+            f.close()
+            raise
+        panic("Unreachable compression state", RuntimeError)
 
 class AdbReader:
     VAL_TYPE_MASK = 0xF0000000
@@ -573,17 +753,46 @@ def _tar_add_data_file(tar: tarfile.TarFile, f: FileEntry, payload: bytes, seen_
     ti.size = len(payload)
     tar.addfile(ti, io.BytesIO(payload))
 
+class _TarDataStream:
+    def __init__(self, stream: ApkByteStream, size: int):
+        self._stream = stream
+        self._remaining = size
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        if size < 0 or size > self._remaining:
+            size = self._remaining
+        data = self._stream.read_exact(size, "DATA payload")
+        self._remaining -= len(data)
+        return data
+
+def _tar_add_data_file_stream(
+    tar: tarfile.TarFile,
+    f: FileEntry,
+    data_len: int,
+    stream: ApkByteStream,
+    seen_dirs: set[str],
+):
+    path = f["path"]
+    _tar_add_parent_dirs(tar, path, seen_dirs)
+    ti = _tarinfo_base(path, f["mode"], f["mtime"])
+    ti.size = data_len
+    tar.addfile(ti, _TarDataStream(stream, data_len))
+
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
-def _parse_block(buf, offset: int, limit: int) -> tuple[int, int, int, int]:
-    if offset + SZ_CU32 > limit:
-        panic(f"Truncated block type/size at offset {offset}", FormatError)
+def _parse_block(stream: ApkByteStream) -> Optional[tuple[int, int, int]]:
+    type_size_raw = stream.read_exact_or_none(SZ_CU32, "block type/size")
+    if type_size_raw is None:
+        return None
 
-    type_size = Cu32.from_buffer_copy(buf, offset).value
+    type_size = Cu32.from_buffer_copy(type_size_raw, 0).value
     block_type = type_size >> 30
     if block_type == AdbBlockType.EXT:
-        blk = CAdbBlock.from_buffer_copy(buf, offset)
+        ext = stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
+        blk = CAdbBlock.from_buffer_copy(type_size_raw + ext, 0)
         block_type = type_size & 0x3fffffff
         raw_size = blk.x_size
         hdr_size = SZ_CADB_BLOCK
@@ -592,17 +801,13 @@ def _parse_block(buf, offset: int, limit: int) -> tuple[int, int, int, int]:
         hdr_size = SZ_CU32
 
     if raw_size < hdr_size:
-        panic(f"Invalid block raw size {raw_size} at offset {offset}", FormatError)
-    if offset + raw_size > limit:
-        panic(f"Block at offset {offset} exceeds stream boundary", FormatError)
+        panic(f"Invalid block raw size {raw_size}", FormatError)
 
-    next_offset = offset + _align_up(raw_size, 8)
-    if next_offset > limit:
-        panic(f"Block padding at offset {offset} exceeds stream boundary", FormatError)
+    payload_size = raw_size - hdr_size
+    pad_size = _align_up(raw_size, 8) - raw_size
+    return block_type, payload_size, pad_size
 
-    return block_type, hdr_size, raw_size - hdr_size, next_offset
-
-def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]) -> int:
+def _dump_blocks(stream: ApkByteStream, schema: int, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]):
     seen_adb = False
     seen_data = False
     file_lookup: dict[tuple[int, int], FileEntry] = {}
@@ -610,9 +815,11 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
     seen_dirs: set[str] = set()
     index = 0
 
-    while offset < limit:
-        block_type, hdr_size, payload_size, next_offset = _parse_block(buf, offset, limit)
-        payload_off = offset + hdr_size
+    while True:
+        blk = _parse_block(stream)
+        if blk is None:
+            break
+        block_type, payload_size, pad_size = blk
 
         match block_type:
             case AdbBlockType.ADB:
@@ -620,13 +827,14 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
                     panic("Invalid block order: ADB block after SIG/DATA", FormatError)
                 if payload_size < SZ_CADB_HDR:
                     panic("ADB block payload too small", FormatError)
-                adb_hdr = CAdbHdr.from_buffer_copy(buf, payload_off)
+                adb_payload = stream.read_exact(payload_size, "ADB block payload")
+                adb_hdr = CAdbHdr.from_buffer_copy(adb_payload, 0)
                 logger.info(
                     f"  [{index}] ADB payload={payload_size} compat={adb_hdr.adb_compat_ver} ver={adb_hdr.adb_ver}"
                 )
                 if schema == AdbSchema.PACKAGE:
                     metadata, dirs, files, file_lookup = AdbReader(
-                        bytes(buf[payload_off:payload_off + payload_size])
+                        adb_payload
                     ).parse_package()
                     meta_schemas.append({
                         "schema": "package",
@@ -654,7 +862,8 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
                     panic("Invalid block order: SIG block position", FormatError)
                 if payload_size < SZ_CADB_SIGN_HDR:
                     panic("SIG block payload too small", FormatError)
-                sig = CAdbSignHdr.from_buffer_copy(buf, payload_off)
+                sig_payload = stream.read_exact(payload_size, "SIG block payload")
+                sig = CAdbSignHdr.from_buffer_copy(sig_payload, 0)
                 logger.info(
                     f"  [{index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
                 )
@@ -665,7 +874,8 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
                 if schema == AdbSchema.PACKAGE:
                     if payload_size < SZ_CADB_DATA_PACKAGE:
                         panic("Package DATA block payload too small", FormatError)
-                    hdr = CAdbDataPackage.from_buffer_copy(buf, payload_off)
+                    data_hdr = stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
+                    hdr = CAdbDataPackage.from_buffer_copy(data_hdr, 0)
                     data_len = payload_size - SZ_CADB_DATA_PACKAGE
                     file_info = file_lookup.get((hdr.path_idx, hdr.file_idx))
                     logger.info(
@@ -682,74 +892,28 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
 
                     if file_info["kind"] != "file":
                         panic(f"DATA block points to non-regular file '{file_info['path']}'", FormatError)
-                    payload = bytes(buf[payload_off + SZ_CADB_DATA_PACKAGE:payload_off + payload_size])
-                    if len(payload) != file_info["size"]:
+                    if data_len != file_info["size"]:
                         panic(
-                            f"DATA size mismatch for '{file_info['path']}': {len(payload)} != {file_info['size']}",
+                            f"DATA size mismatch for '{file_info['path']}': {data_len} != {file_info['size']}",
                             FormatError,
                         )
-                    _tar_add_data_file(tar, file_info, payload, seen_dirs)
+                    _tar_add_data_file_stream(tar, file_info, data_len, stream, seen_dirs)
                 else:
                     logger.info(f"  [{index}] DATA payload={payload_size}")
+                    stream.skip(payload_size, "DATA payload")
             case _:
-                panic(f"Unknown block type {block_type} at offset {offset}", FormatError)
+                panic(f"Unknown block type {block_type}", FormatError)
 
-        offset = next_offset
+        if pad_size:
+            stream.skip(pad_size, "block padding")
         index += 1
 
     if not seen_adb:
         panic("ADB stream did not contain an ADB block", FormatError)
-    return offset
 
 def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
-    with ExitStack() as stack:
-        f = stack.enter_context(path_apk.open("rb"))
-        size = f.seek(0, io.SEEK_END)
-        if size < 4:
-            panic("File too small, meanless to dump")
-        mm = stack.enter_context(mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ))
-        if mm[0:3] != b"ADB":
-            panic("File is not an APK", FormatError)
-        match mm[3]:
-            case AdbCompressionWay.NONE:
-                body = mm
-                offset = 4
-            case AdbCompressionWay.DEFLATE:
-                body = zlib.decompress(mm[4:], wbits=-15)
-                if body[0:3] != b"ADB":
-                    panic("Inner deflate stream is not an APK", FormatError)
-                offset = 4
-                stack.close()
-                del mm
-                del f
-            case AdbCompressionWay.CUSTOM:
-                spec = CAdbCompressionSpec.from_buffer_copy(mm, 4)
-                match spec.alg:
-                    case AdbCompressionAlg.NONE:
-                        body = mm
-                        offset = 6
-                    case AdbCompressionAlg.DEFLATE:
-                        body = zlib.decompress(mm[6:], wbits=-15)
-                        if body[0:3] != b"ADB":
-                            panic("Inner deflate stream is not an APK", FormatError)
-                        offset = 4
-                        stack.close()
-                        del mm
-                        del f
-                    case AdbCompressionAlg.ZSTD:
-                        body = zstd.decompress(mm[6:])
-                        if body[0:3] != b"ADB":
-                            panic("Inner zstd stream is not an APK", FormatError)
-                        offset = 4
-                        stack.close()
-                        del mm
-                        del f
-                    case _:
-                        panic(f"Invalid compression alg ID {spec.alg} (level {spec.level}) ", FormatError)
-                del spec
-            case _:
-                panic(f"Invalid compression magic {mm[3]:x}", FormatError)
-        size = len(body)
+    with ApkBodySource.open(path_apk) as src:
+        stream = src.stream
 
         mode_tar = "w:"
         if path_tar:
@@ -758,34 +922,30 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
         else:
             path_tar = Path("/dev/null")
 
-        tar = stack.enter_context(
-            tarfile.open(path_tar, mode_tar) # type: ignore
-        )
+        with tarfile.open(path_tar, mode_tar) as tar, (path_meta or Path("/dev/null")).open("w") as f_meta: # type: ignore[arg-type]
+            meta_schemas: list[PackageSchemaMeta] = []
+            meta_doc: dict[str, str | list[PackageSchemaMeta]] = {
+                "apk": str(path_apk),
+                "schemas": meta_schemas,
+            }
 
-        f_meta = stack.enter_context((path_meta or Path("/dev/null")).open("w"))
-        meta_schemas: list[PackageSchemaMeta] = []
-        meta_doc: dict[str, str | list[PackageSchemaMeta]] = {
-            "apk": str(path_apk),
-            "schemas": meta_schemas,
-        }
+            while True:
+                schema_raw = stream.read_exact_or_none(SZ_CADB_SCHEMA, "schema")
+                if schema_raw is None:
+                    break
+                schema = CAdbSchema.from_buffer_copy(schema_raw, 0).value
 
-        while offset < size:
-            if offset + SZ_CADB_SCHEMA > size:
-                panic(f"Truncated schema at offset {offset}", FormatError)
-            schema = CAdbSchema.from_buffer_copy(body, offset).value
-            offset += SZ_CADB_SCHEMA
+                match schema:
+                    case AdbSchema.PACKAGE:
+                        logger.info("Schema: package")
+                        _dump_blocks(stream, schema, tar, meta_schemas)
+                    case AdbSchema.INDEX:
+                        panic("Schema for index is not supported yet", NotImplementedError)
+                    case _:
+                        panic(f"Unknown schema {schema:#x}", FormatError)
 
-            match schema:
-                case AdbSchema.PACKAGE:
-                    logger.info("Schema: package")
-                    offset = _dump_blocks(body, offset, size, schema, tar, meta_schemas)
-                case AdbSchema.INDEX:
-                    panic("Schema for index is not supported yet", NotImplementedError)
-                case _:
-                    panic(f"Unknown schema {schema:#x}", FormatError)
-
-        json.dump(meta_doc, f_meta, indent=2, sort_keys=True)
-        f_meta.write("\n")
+            json.dump(meta_doc, f_meta, indent=2, sort_keys=True)
+            f_meta.write("\n")
 
 
 if __name__ == "__main__":
