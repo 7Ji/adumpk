@@ -522,7 +522,7 @@ class AdbReader:
         }
         return op_map.get(base, "?")
 
-    def parse_dep(self, dep_tag: int) -> Optional[str]:
+    def _parse_dep(self, dep_tag: int) -> Optional[str]:
         dep = self.read_obj(dep_tag)
         name = self.blob_to_text(self.read_blob(self.obj_get(dep, AdbDepField.NAME)))
         ver = self.blob_to_text(self.read_blob(self.obj_get(dep, AdbDepField.VERSION)))
@@ -536,19 +536,19 @@ class AdbReader:
             return f"{conflict}{name}"
         return f"{conflict}{name}{self._dep_op_string(op)}{ver}"
 
-    def parse_dep_array(self, arr_tag: int) -> list[str]:
+    def _parse_dep_array(self, arr_tag: int) -> list[str]:
         out = []
         arr = self.read_obj(arr_tag)
         for i in range(1, len(arr)):
             tag = arr[i]
             if tag == 0:
                 continue
-            dep = self.parse_dep(tag)
+            dep = self._parse_dep(tag)
             if dep is not None:
                 out.append(dep)
         return out
 
-    def parse_string_array(self, arr_tag: int) -> list[str]:
+    def _parse_string_array(self, arr_tag: int) -> list[str]:
         out = []
         arr = self.read_obj(arr_tag)
         for i in range(1, len(arr)):
@@ -560,7 +560,7 @@ class AdbReader:
                 out.append(text)
         return out
 
-    def parse_pkginfo(self, pkginfo_tag: int) -> PackageMetadata:
+    def _parse_pkginfo(self, pkginfo_tag: int) -> PackageMetadata:
         meta: PackageMetadata = {}
         obj = self.read_obj(pkginfo_tag)
         for idx in range(1, len(obj)):
@@ -569,10 +569,10 @@ class AdbReader:
                 continue
             name = str(AdbPkgInfoType(idx))
             if idx in self.PKGINFO_DEP_FIELDS:
-                meta[name] = self.parse_dep_array(tag)
+                meta[name] = self._parse_dep_array(tag)
                 continue
             if idx == int(AdbPkgInfoField.TAGS):
-                meta[name] = self.parse_string_array(tag)
+                meta[name] = self._parse_string_array(tag)
                 continue
             ival = self.read_int(tag)
             if ival is not None:
@@ -632,7 +632,7 @@ class AdbReader:
         metadata: PackageMetadata = {}
         pkginfo_tag = self.obj_get(pkg, AdbPkgField.PKGINFO)
         if pkginfo_tag != 0:
-            metadata = self.parse_pkginfo(pkginfo_tag)
+            metadata = self._parse_pkginfo(pkginfo_tag)
 
         dirs: list[DirectoryEntry] = []
         file_entries: list[FileEntry] = []
