@@ -771,9 +771,6 @@ class TarEmitter:
         ti.size = data_len
         self.tar.addfile(ti, _TarDataStream(stream, data_len))
 
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
 def _parse_block(stream: ApkByteStream) -> Optional[tuple[int, int, int]]:
     type_size_raw = stream.read_exact_or_none(SZ_CU32, "block type/size")
     if type_size_raw is None:
@@ -795,7 +792,7 @@ def _parse_block(stream: ApkByteStream) -> Optional[tuple[int, int, int]]:
         panic(f"Invalid block raw size {raw_size}", FormatError)
 
     payload_size = raw_size - hdr_size
-    pad_size = _align_up(raw_size, 8) - raw_size
+    pad_size = ((raw_size + 8 - 1) // 8 * 8) - raw_size
     return block_type, payload_size, pad_size
 
 def _dump_blocks(stream: ApkByteStream, schema: int, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]):
