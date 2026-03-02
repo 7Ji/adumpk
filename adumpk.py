@@ -639,7 +639,7 @@ class AdbReader:
     def parse_package(self) -> tuple[PackageMetadata, list[DirectoryEntry], list[FileEntry], dict[tuple[int, int], FileEntry]]:
         if len(self.adb) < SZ_CADB_HDR:
             panic("ADB payload too small for header", FormatError)
-        hdr = CAdbHdr.from_buffer_copy(self.adb, 0)
+        hdr = CAdbHdr.from_buffer_copy(self.adb)
         pkg = self.read_obj(hdr.root)
 
         metadata: PackageMetadata = {}
@@ -797,11 +797,11 @@ class ApkDumper:
         if type_size_raw is None:
             return None
 
-        type_size = Cu32.from_buffer_copy(type_size_raw, 0).value
+        type_size = Cu32.from_buffer_copy(type_size_raw).value
         block_type = type_size >> 30
         if block_type == AdbBlockType.EXT:
             ext = self.stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
-            blk = CAdbBlock.from_buffer_copy(type_size_raw + ext, 0)
+            blk = CAdbBlock.from_buffer_copy(type_size_raw + ext)
             block_type = type_size & 0x3fffffff
             raw_size = blk.x_size
             hdr_size = SZ_CADB_BLOCK
@@ -836,7 +836,7 @@ class ApkDumper:
                     if payload_size < SZ_CADB_HDR:
                         panic("ADB block payload too small", FormatError)
                     adb_payload = self.stream.read_exact(payload_size, "ADB block payload")
-                    adb_hdr = CAdbHdr.from_buffer_copy(adb_payload, 0)
+                    adb_hdr = CAdbHdr.from_buffer_copy(adb_payload)
                     logger.info(
                         f"  [{index}] ADB payload={payload_size} compat={adb_hdr.adb_compat_ver} ver={adb_hdr.adb_ver}"
                     )
@@ -870,7 +870,7 @@ class ApkDumper:
                     if payload_size < SZ_CADB_SIGN_HDR:
                         panic("SIG block payload too small", FormatError)
                     sig_payload = self.stream.read_exact(payload_size, "SIG block payload")
-                    sig = CAdbSignHdr.from_buffer_copy(sig_payload, 0)
+                    sig = CAdbSignHdr.from_buffer_copy(sig_payload)
                     logger.info(
                         f"  [{index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
                     )
@@ -882,7 +882,7 @@ class ApkDumper:
                         if payload_size < SZ_CADB_DATA_PACKAGE:
                             panic("Package DATA block payload too small", FormatError)
                         data_hdr = self.stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
-                        hdr = CAdbDataPackage.from_buffer_copy(data_hdr, 0)
+                        hdr = CAdbDataPackage.from_buffer_copy(data_hdr)
                         data_len = payload_size - SZ_CADB_DATA_PACKAGE
                         file_info = file_lookup.get((hdr.path_idx, hdr.file_idx))
                         logger.info(
@@ -923,7 +923,7 @@ class ApkDumper:
             schema_raw = self.stream.read_exact_or_none(SZ_CADB_SCHEMA, "schema")
             if schema_raw is None:
                 break
-            schema = CAdbSchema.from_buffer_copy(schema_raw, 0).value
+            schema = CAdbSchema.from_buffer_copy(schema_raw).value
 
             match schema:
                 case AdbSchema.PACKAGE:
