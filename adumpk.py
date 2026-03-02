@@ -3,7 +3,10 @@ from abc import ABC, abstractmethod
 import argparse
 import ctypes
 from ctypes import LittleEndianStructure
-from compression import zstd
+try:
+    from compression import zstd
+except ModuleNotFoundError:
+    zstd = None
 from dataclasses import asdict, dataclass, field
 from enum import IntEnum, StrEnum
 import io
@@ -376,7 +379,10 @@ class DeflateApkByteStream(ApkByteStream):
 class ZstdApkByteStream(ApkByteStream):
     def __init__(self, f: BinaryIO):
         self._f = f
-        self._dec = zstd.ZstdDecompressor()
+        if zstd is None:
+            panic("Zstd module was not imported")
+        else:
+            self._dec = zstd.ZstdDecompressor()
         self._out = RingByteBuffer()
         self._done = False
 
@@ -466,6 +472,8 @@ class ApkBodySource:
                             cls.assert_header(stream, "Inner deflate stream")
                             return cls(f, stream)
                         case AdbCompressionAlg.ZSTD:
+                            if zstd is None:
+                                panic("Zstd compression not supported on current Python installation")
                             f.seek(6)
                             stream = ZstdApkByteStream(f)
                             cls.assert_header(stream, "Inner zstd stream")
