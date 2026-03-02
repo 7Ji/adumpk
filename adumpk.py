@@ -297,35 +297,87 @@ class RawApkByteStream(ApkByteStream):
     def read(self, size: int) -> bytes:
         return self._f.read(size)
 
+class RingByteBuffer:
+    def __init__(self, capacity: int = 1024 * 1024):
+        self._buf = bytearray(capacity)
+        self._head = 0
+        self._size = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def _ensure_capacity(self, required: int):
+        if required <= len(self._buf):
+            return
+        new_cap = len(self._buf)
+        while new_cap < required:
+            new_cap *= 2
+        new_buf = bytearray(new_cap)
+        if self._size > 0:
+            first = min(self._size, len(self._buf) - self._head)
+            new_buf[0:first] = self._buf[self._head:self._head + first]
+            second = self._size - first
+            if second > 0:
+                new_buf[first:first + second] = self._buf[0:second]
+        self._buf = new_buf
+        self._head = 0
+
+    def write(self, data: bytes):
+        if not data:
+            return
+        data_len = len(data)
+        self._ensure_capacity(self._size + data_len)
+        tail = (self._head + self._size) % len(self._buf)
+        first = min(data_len, len(self._buf) - tail)
+        self._buf[tail:tail + first] = data[0:first]
+        second = data_len - first
+        if second > 0:
+            self._buf[0:second] = data[first:first + second]
+        self._size += data_len
+
+    def read(self, size: int) -> bytes:
+        if size <= 0 or self._size == 0:
+            return b""
+        out_len = min(size, self._size)
+        first = min(out_len, len(self._buf) - self._head)
+        if first == out_len:
+            out = bytes(self._buf[self._head:self._head + out_len])
+        else:
+            out = (
+                bytes(self._buf[self._head:self._head + first]) +
+                bytes(self._buf[0:out_len - first])
+            )
+        self._head = (self._head + out_len) % len(self._buf)
+        self._size -= out_len
+        return out
+
 class DeflateApkByteStream(ApkByteStream):
     def __init__(self, f: BinaryIO):
         self._f = f
         self._dec = zlib.decompressobj(wbits=-15)
-        self._out = bytearray()
+        self._out = RingByteBuffer()
         self._eof = False
 
     def _fill(self, size: int):
         while len(self._out) < size and not self._eof:
             in_chunk = self._f.read(1024 * 1024)
             if not in_chunk:
-                self._out.extend(self._dec.flush())
+                self._out.write(self._dec.flush())
                 self._eof = True
                 break
-            self._out.extend(self._dec.decompress(in_chunk))
+            self._out.write(self._dec.decompress(in_chunk))
 
     def read(self, size: int) -> bytes:
         if size <= 0:
             return b""
         self._fill(size)
-        out = bytes(self._out[:size])
-        del self._out[:len(out)]
-        return out
+        return self._out.read(size)
 
 class ZstdApkByteStream(ApkByteStream):
     def __init__(self, f: BinaryIO):
         self._f = f
         self._dec = zstd.ZstdDecompressor()
-        self._out = bytearray()
+        self._out = RingByteBuffer()
         self._done = False
 
     def _fill(self, size: int):
@@ -339,7 +391,7 @@ class ZstdApkByteStream(ApkByteStream):
 
             out_chunk = self._dec.decompress(in_chunk, max_length=1024 * 1024)
             if out_chunk:
-                self._out.extend(out_chunk)
+                self._out.write(out_chunk)
             elif self._dec.needs_input and not in_chunk:
                 panic("Truncated zstd stream", FormatError)
 
@@ -351,9 +403,7 @@ class ZstdApkByteStream(ApkByteStream):
         if size <= 0:
             return b""
         self._fill(size)
-        out = bytes(self._out[:size])
-        del self._out[:len(out)]
-        return out
+        return self._out.read(size)
 
 class ApkBodySource:
     def __init__(self, f: BinaryIO, stream: ApkByteStream):
