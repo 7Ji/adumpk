@@ -4,7 +4,7 @@ import argparse
 import ctypes
 from ctypes import LittleEndianStructure
 from compression import zstd
-from enum import IntEnum
+from enum import Enum, IntEnum
 import io
 import json
 import logging
@@ -192,7 +192,13 @@ SZ_CADB_DATA_PACKAGE = ctypes.sizeof(CAdbDataPackage)
 
 PkgMetaValue = int | str | list[str]
 PackageMetadata = dict[str, PkgMetaValue]
-FileKind = Literal["file", "symlink", "hardlink", "special", "unknown"]
+
+class FileKind(str, Enum):
+    FILE = "file"
+    SYMLINK = "symlink"
+    HARDLINK = "hardlink"
+    SPECIAL = "special"
+    UNKNOWN = "unknown"
 
 class DirectoryEntry(TypedDict):
     path: str
@@ -602,7 +608,7 @@ class AdbReader:
     @staticmethod
     def _parse_target_blob(target: Optional[bytes]) -> tuple[FileKind, Optional[str], Optional[int]]:
         if not target:
-            return "file", None, None
+            return FileKind.FILE, None, None
         if len(target) < 2:
             panic("Invalid target blob too short", FormatError)
         tmode = int.from_bytes(target[0:2], "little")
@@ -610,19 +616,19 @@ class AdbReader:
         ftype = stat.S_IFMT(tmode)
         if ftype == stat.S_IFLNK:
             try:
-                return "symlink", payload.decode("utf-8"), None
+                return FileKind.SYMLINK, payload.decode("utf-8"), None
             except UnicodeDecodeError:
-                return "symlink", payload.decode("utf-8", errors="surrogateescape"), None
+                return FileKind.SYMLINK, payload.decode("utf-8", errors="surrogateescape"), None
         if ftype == stat.S_IFREG:
             try:
-                return "hardlink", payload.decode("utf-8"), None
+                return FileKind.HARDLINK, payload.decode("utf-8"), None
             except UnicodeDecodeError:
-                return "hardlink", payload.decode("utf-8", errors="surrogateescape"), None
+                return FileKind.HARDLINK, payload.decode("utf-8", errors="surrogateescape"), None
         if ftype in (stat.S_IFBLK, stat.S_IFCHR, stat.S_IFIFO):
             if len(payload) != 8:
                 panic("Invalid device/fifo target blob length", FormatError)
-            return "special", None, int.from_bytes(payload, "little")
-        return "unknown", None, None
+            return FileKind.SPECIAL, None, int.from_bytes(payload, "little")
+        return FileKind.UNKNOWN, None, None
 
     def parse_package(self) -> tuple[PackageMetadata, list[DirectoryEntry], list[FileEntry], dict[tuple[int, int], FileEntry]]:
         if len(self.adb) < SZ_CADB_HDR:
@@ -747,18 +753,18 @@ class TarEmitter:
         path = f["path"]
         self._add_parent_dirs(path)
         match kind:
-            case "file":
+            case FileKind.FILE:
                 if f["size"] == 0:
                     ti = _tarinfo_base(path, f["mode"], f["mtime"])
                     ti.size = 0
                     self.tar.addfile(ti, io.BytesIO())
-            case "symlink":
+            case FileKind.SYMLINK:
                 ti = _tarinfo_base(path, f["mode"], f["mtime"])
                 ti.type = tarfile.SYMTYPE
                 ti.linkname = f["link_target"] or ""
                 ti.size = 0
                 self.tar.addfile(ti)
-            case "hardlink":
+            case FileKind.HARDLINK:
                 ti = _tarinfo_base(path, f["mode"], f["mtime"])
                 ti.type = tarfile.LNKTYPE
                 ti.linkname = f["link_target"] or ""
@@ -884,7 +890,7 @@ class ApkDumper:
                             panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
                         written_data.add(key)
 
-                        if file_info["kind"] != "file":
+                        if file_info["kind"] != FileKind.FILE:
                             panic(f"DATA block points to non-regular file '{file_info['path']}'", FormatError)
                         if data_len != file_info["size"]:
                             panic(
