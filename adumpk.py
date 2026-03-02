@@ -425,8 +425,19 @@ class AdbReader:
         int(AdbPkgInfoField.HASHES),
         int(AdbPkgInfoField.REPO_COMMIT),
     }
-    DEPMASK_ANY = int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.LESS) | int(ApkVersionFlag.GREATER)
-    DEPMASK_CHECKSUM = int(ApkVersionFlag.LESS) | int(ApkVersionFlag.GREATER)
+    DEP_OP_MAP = {
+        int(ApkVersionFlag.LESS): "<",
+        int(ApkVersionFlag.LESS) | int(ApkVersionFlag.EQUAL): "<=",
+        int(ApkVersionFlag.LESS) | int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): "<~",
+        int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): "~",
+        int(ApkVersionFlag.FUZZY): "~",
+        int(ApkVersionFlag.EQUAL): "=",
+        int(ApkVersionFlag.GREATER) | int(ApkVersionFlag.EQUAL): ">=",
+        int(ApkVersionFlag.GREATER) | int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): ">~",
+        int(ApkVersionFlag.GREATER): ">",
+        int(ApkVersionFlag.LESS) | int(ApkVersionFlag.GREATER): "><",
+        int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.LESS) | int(ApkVersionFlag.GREATER): "",
+    }
 
     def __init__(self, adb_payload: bytes):
         self.adb = adb_payload
@@ -518,20 +529,7 @@ class AdbReader:
 
     def _dep_op_string(self, op: int) -> str:
         base = op & ~int(ApkVersionFlag.CONFLICT)
-        op_map = {
-            int(ApkVersionFlag.LESS): "<",
-            int(ApkVersionFlag.LESS) | int(ApkVersionFlag.EQUAL): "<=",
-            int(ApkVersionFlag.LESS) | int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): "<~",
-            int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): "~",
-            int(ApkVersionFlag.FUZZY): "~",
-            int(ApkVersionFlag.EQUAL): "=",
-            int(ApkVersionFlag.GREATER) | int(ApkVersionFlag.EQUAL): ">=",
-            int(ApkVersionFlag.GREATER) | int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): ">~",
-            int(ApkVersionFlag.GREATER): ">",
-            self.DEPMASK_CHECKSUM: "><",
-            self.DEPMASK_ANY: "",
-        }
-        return op_map.get(base, "?")
+        return self.DEP_OP_MAP.get(base, "?")
 
     def _parse_dep(self, dep_tag: int) -> Optional[str]:
         dep = self.read_obj(dep_tag)
