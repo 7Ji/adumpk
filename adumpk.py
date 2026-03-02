@@ -5,7 +5,7 @@ import ctypes
 from ctypes import LittleEndianStructure
 from compression import zstd
 from dataclasses import asdict, dataclass, field
-from enum import Enum, IntEnum
+from enum import IntEnum, StrEnum
 import io
 import json
 import logging
@@ -194,7 +194,7 @@ SZ_CADB_DATA_PACKAGE = ctypes.sizeof(CAdbDataPackage)
 PkgMetaValue = int | str | list[str]
 PackageMetadata = dict[str, PkgMetaValue]
 
-class FileKind(str, Enum):
+class FileKind(StrEnum):
     FILE = "file"
     SYMLINK = "symlink"
     HARDLINK = "hardlink"
