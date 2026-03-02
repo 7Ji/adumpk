@@ -792,30 +792,6 @@ class ApkDumper:
         self.tar_writer = TarEmitter(tar)
         self.meta_schemas = meta_schemas
 
-    def _parse_block(self) -> Optional[tuple[int, int, int]]:
-        type_size_raw = self.stream.read_exact_or_none(SZ_CU32, "block type/size")
-        if type_size_raw is None:
-            return None
-
-        type_size = Cu32.from_buffer_copy(type_size_raw).value
-        block_type = type_size >> 30
-        if block_type == AdbBlockType.EXT:
-            ext = self.stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
-            blk = CAdbBlock.from_buffer_copy(type_size_raw + ext)
-            block_type = type_size & 0x3fffffff
-            raw_size = blk.x_size
-            hdr_size = SZ_CADB_BLOCK
-        else:
-            raw_size = type_size & 0x3fffffff
-            hdr_size = SZ_CU32
-
-        if raw_size < hdr_size:
-            panic(f"Invalid block raw size {raw_size}", FormatError)
-
-        payload_size = raw_size - hdr_size
-        pad_size = ((raw_size + 8 - 1) // 8 * 8) - raw_size
-        return block_type, payload_size, pad_size
-
     def _dump_blocks(self, schema: int):
         seen_adb = False
         seen_data = False
@@ -824,10 +800,26 @@ class ApkDumper:
         index = 0
 
         while True:
-            blk = self._parse_block()
-            if blk is None:
+            type_size_raw = self.stream.read_exact_or_none(SZ_CU32, "block type/size")
+            if type_size_raw is None:
                 break
-            block_type, payload_size, pad_size = blk
+
+            type_size = Cu32.from_buffer_copy(type_size_raw).value
+            block_type = type_size >> 30
+            if block_type == AdbBlockType.EXT:
+                ext = self.stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
+                blk = CAdbBlock.from_buffer_copy(type_size_raw + ext)
+                block_type = type_size & 0x3fffffff
+                raw_size = blk.x_size
+                hdr_size = SZ_CADB_BLOCK
+            else:
+                raw_size = type_size & 0x3fffffff
+                hdr_size = SZ_CU32
+
+            if raw_size < hdr_size:
+                panic(f"Invalid block raw size {raw_size}", FormatError)
+
+            payload_size = raw_size - hdr_size
 
             match block_type:
                 case AdbBlockType.ADB:
@@ -911,8 +903,9 @@ class ApkDumper:
                 case _:
                     panic(f"Unknown block type {block_type}", FormatError)
 
-            if pad_size:
-                self.stream.skip(pad_size, "block padding")
+            pad_remainder = raw_size & 0x7
+            if pad_remainder:
+                self.stream.skip(8 - pad_remainder, "block padding")
             index += 1
 
         if not seen_adb:
