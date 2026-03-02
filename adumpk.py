@@ -614,21 +614,23 @@ class AdbReader:
         tmode = int.from_bytes(target[0:2], "little")
         payload = target[2:]
         ftype = stat.S_IFMT(tmode)
-        if ftype == stat.S_IFLNK:
-            try:
-                return FileKind.SYMLINK, payload.decode("utf-8"), None
-            except UnicodeDecodeError:
-                return FileKind.SYMLINK, payload.decode("utf-8", errors="surrogateescape"), None
-        if ftype == stat.S_IFREG:
-            try:
-                return FileKind.HARDLINK, payload.decode("utf-8"), None
-            except UnicodeDecodeError:
-                return FileKind.HARDLINK, payload.decode("utf-8", errors="surrogateescape"), None
-        if ftype in (stat.S_IFBLK, stat.S_IFCHR, stat.S_IFIFO):
-            if len(payload) != 8:
-                panic("Invalid device/fifo target blob length", FormatError)
-            return FileKind.SPECIAL, None, int.from_bytes(payload, "little")
-        return FileKind.UNKNOWN, None, None
+        match ftype:
+            case stat.S_IFLNK:
+                try:
+                    return FileKind.SYMLINK, payload.decode("utf-8"), None
+                except UnicodeDecodeError:
+                    return FileKind.SYMLINK, payload.decode("utf-8", errors="surrogateescape"), None
+            case stat.S_IFREG:
+                try:
+                    return FileKind.HARDLINK, payload.decode("utf-8"), None
+                except UnicodeDecodeError:
+                    return FileKind.HARDLINK, payload.decode("utf-8", errors="surrogateescape"), None
+            case stat.S_IFBLK | stat.S_IFCHR | stat.S_IFIFO:
+                if len(payload) != 8:
+                    panic("Invalid device/fifo target blob length", FormatError)
+                return FileKind.SPECIAL, None, int.from_bytes(payload, "little")
+            case _:
+                return FileKind.UNKNOWN, None, None
 
     def parse_package(self) -> tuple[PackageMetadata, list[DirectoryEntry], list[FileEntry], dict[tuple[int, int], FileEntry]]:
         if len(self.adb) < SZ_CADB_HDR:
