@@ -811,12 +811,19 @@ class _TarDataStream:
 
 class TarEmitter:
     NOBODY_ID = 65534
+    USER_TO_UID = {
+        "root": 0,
+        "nobody": 65534,
+    }
+    GROUP_TO_GID = {
+        "root": 0,
+        "nobody": 65534,
+        "nogroup": 65534,
+    }
 
     def __init__(self, tar: tarfile.TarFile):
         self.tar = tar
         self.seen_dirs: set[str] = set()
-        self._uid_cache: dict[Optional[str], int] = {}
-        self._gid_cache: dict[Optional[str], int] = {}
 
     @staticmethod
     def _safe_pax_component(name: str) -> str:
@@ -825,36 +832,10 @@ class TarEmitter:
         return f"hex:{name.encode('utf-8', errors='replace').hex()}"
 
     def _resolve_uid(self, user: Optional[str]) -> int:
-        cached = self._uid_cache.get(user)
-        if cached is not None:
-            return cached
-        uid = self.NOBODY_ID
-        if user:
-            try:
-                uid = int(user, 10)
-            except ValueError:
-                if user == "root":
-                    uid = 0
-                elif user == "nobody":
-                    uid = self.NOBODY_ID
-        self._uid_cache[user] = uid
-        return uid
+        return self.USER_TO_UID.get(user, 0) if user else 0
 
     def _resolve_gid(self, group: Optional[str]) -> int:
-        cached = self._gid_cache.get(group)
-        if cached is not None:
-            return cached
-        gid = self.NOBODY_ID
-        if group:
-            try:
-                gid = int(group, 10)
-            except ValueError:
-                if group == "root":
-                    gid = 0
-                elif group == "nobody":
-                    gid = self.NOBODY_ID
-        self._gid_cache[group] = gid
-        return gid
+        return self.GROUP_TO_GID.get(group, 0) if group else 0
 
     def _build_pax_headers(
         self,
