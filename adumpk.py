@@ -57,11 +57,14 @@ class AdbValType(IntEnum):
     ARRAY = 0xD0000000
     OBJECT = 0xE0000000
 
-class AdbPkgField(IntEnum):
+class AdbField(IntEnum):
+    pass
+
+class AdbPkgField(AdbField):
     PKGINFO = 1
     PATHS = 2
 
-class AdbPkgInfoField(IntEnum):
+class AdbPkgInfoField(AdbField):
     HASHES = 3
     DEPENDS = 15
     PROVIDES = 16
@@ -71,24 +74,24 @@ class AdbPkgInfoField(IntEnum):
     TAGS = 21
     REPO_COMMIT = 10
 
-class AdbDirField(IntEnum):
+class AdbDirField(AdbField):
     NAME = 1
     ACL = 2
     FILES = 3
 
-class AdbFileField(IntEnum):
+class AdbFileField(AdbField):
     NAME = 1
     ACL = 2
     SIZE = 3
     MTIME = 4
     TARGET = 6
 
-class AdbDepField(IntEnum):
+class AdbDepField(AdbField):
     NAME = 1
     VERSION = 2
     MATCH = 3
 
-class AdbAclField(IntEnum):
+class AdbAclField(AdbField):
     MODE = 1
     USER = 2
     GROUP = 3
@@ -512,10 +515,9 @@ class AdbReader:
         return [Cu32.from_buffer_copy(self.adb, off + i * SZ_CU32).value for i in range(num)]
 
     @staticmethod
-    def obj_get(obj: list[int], index: int | IntEnum) -> int:
-        idx = int(index)
-        if idx < len(obj):
-            return obj[idx]
+    def obj_get(obj: list[int], index: AdbField) -> int:
+        if index < len(obj):
+            return obj[index]
         return 0
 
     @staticmethod
