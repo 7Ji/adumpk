@@ -415,8 +415,6 @@ class ApkBodySource:
         panic("Unreachable compression state", RuntimeError)
 
 class AdbReader:
-    VAL_TYPE_MASK = 0xF0000000
-    VAL_DATA_MASK = 0x0FFFFFFF
     PKGINFO_DEP_FIELDS = {
         int(AdbPkgInfoField.DEPENDS),
         int(AdbPkgInfoField.PROVIDES),
@@ -445,11 +443,13 @@ class AdbReader:
     def __init__(self, adb_payload: bytes):
         self.adb = adb_payload
 
+    # The highest 4 bits in a value mark is type, as defined in AdbValType
     def _val_type(self, v: int) -> int:
-        return v & self.VAL_TYPE_MASK
+        return v & 0xF0000000
 
+    # The lowest 28 bits in a value mark is type, as defined in AdbValType
     def _val_data(self, v: int) -> int:
-        return v & self.VAL_DATA_MASK
+        return v & 0x0FFFFFFF
 
     def _u16(self, off: int) -> int:
         if off + SZ_CU16 > len(self.adb):
