@@ -445,32 +445,33 @@ class AdbReader:
     def read_int(self, v: int) -> Optional[int]:
         t = self._val_type(v)
         off = self._val_data(v)
-        if t == AdbValType.INT:
-            return off
-        if t == AdbValType.INT32:
-            return self._u32(off)
-        if t == AdbValType.INT64:
-            return self._u64(off)
-        return None
+        match t:
+            case AdbValType.INT:
+                return off
+            case AdbValType.INT32:
+                return self._u32(off)
+            case AdbValType.INT64:
+                return self._u64(off)
+            case _:
+                return None
 
     def read_blob(self, v: int) -> Optional[bytes]:
         t = self._val_type(v)
         off = self._val_data(v)
-        if t == AdbValType.SPECIAL and v == 0:
-            return None
-        if t == AdbValType.BLOB8:
-            if off >= len(self.adb):
-                panic(f"Truncated blob8 length at offset {off}", FormatError)
-            length = self.adb[off]
-            start = off + 1
-        elif t == AdbValType.BLOB16:
-            length = self._u16(off)
-            start = off + 2
-        elif t == AdbValType.BLOB32:
-            length = self._u32(off)
-            start = off + 4
-        else:
-            return None
+        match t:
+            case AdbValType.BLOB8:
+                if off >= len(self.adb):
+                    panic(f"Truncated blob8 length at offset {off}", FormatError)
+                length = self.adb[off]
+                start = off + 1
+            case AdbValType.BLOB16:
+                length = self._u16(off)
+                start = off + 2
+            case AdbValType.BLOB32:
+                length = self._u32(off)
+                start = off + 4
+            case _:
+                return None
         end = start + length
         if end > len(self.adb):
             panic(f"Blob at offset {off} exceeds ADB payload", FormatError)
@@ -745,24 +746,24 @@ class TarEmitter:
         kind = f["kind"]
         path = f["path"]
         self._add_parent_dirs(path)
-        if kind == "file" and f["size"] == 0:
-            ti = _tarinfo_base(path, f["mode"], f["mtime"])
-            ti.size = 0
-            self.tar.addfile(ti, io.BytesIO())
-            return
-        if kind == "symlink":
-            ti = _tarinfo_base(path, f["mode"], f["mtime"])
-            ti.type = tarfile.SYMTYPE
-            ti.linkname = f["link_target"] or ""
-            ti.size = 0
-            self.tar.addfile(ti)
-            return
-        if kind == "hardlink":
-            ti = _tarinfo_base(path, f["mode"], f["mtime"])
-            ti.type = tarfile.LNKTYPE
-            ti.linkname = f["link_target"] or ""
-            ti.size = 0
-            self.tar.addfile(ti)
+        match kind:
+            case "file":
+                if f["size"] == 0:
+                    ti = _tarinfo_base(path, f["mode"], f["mtime"])
+                    ti.size = 0
+                    self.tar.addfile(ti, io.BytesIO())
+            case "symlink":
+                ti = _tarinfo_base(path, f["mode"], f["mtime"])
+                ti.type = tarfile.SYMTYPE
+                ti.linkname = f["link_target"] or ""
+                ti.size = 0
+                self.tar.addfile(ti)
+            case "hardlink":
+                ti = _tarinfo_base(path, f["mode"], f["mtime"])
+                ti.type = tarfile.LNKTYPE
+                ti.linkname = f["link_target"] or ""
+                ti.size = 0
+                self.tar.addfile(ti)
 
     def add_data_file_stream(self, f: FileEntry, data_len: int, stream: ApkByteStream):
         path = f["path"]
