@@ -8,7 +8,7 @@
 ## Usage
 
 ```bash
-./adumpk.py <input.apk> (--tar <output.tar>) (--meta <output.json>)
+./adumpk.py <input.apk> (--tar <output.tar>) (--json <output.json>)
 ```
 
 ### Examples:
@@ -22,13 +22,13 @@ To only print info
 To both print info, convert to tar, and create info JSON:
 
 ```bash
-./adumpk.py /tmp/vim-full-9.2.0-r1.apk --tar /tmp/demo.tar --meta /tmp/demo.json
+./adumpk.py /tmp/vim-full-9.2.0-r1.apk --tar /tmp/demo.tar --json /tmp/demo.json
 ```
 
 The output on terminal would be like the following:
 
 ```log
-> ./adumpk.py /tmp/vim-full-9.2.0-r1.apk --tar /tmp/demo.tar --meta /tmp/demo.json
+> ./adumpk.py /tmp/vim-full-9.2.0-r1.apk --tar /tmp/demo.tar --json /tmp/demo.json
 INFO.... Dumping APK '/tmp/vim-full-9.2.0-r1.apk'
 INFO.... Schema: package
 INFO....   [0] ADB payload=1840 compat=0 ver=0

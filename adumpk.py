@@ -1182,7 +1182,7 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
         else:
             path_tar = Path("/dev/null")
 
-        with tarfile.open(path_tar, mode_tar) as tar, (path_meta or Path("/dev/null")).open("w") as f_meta: # type: ignore[arg-type]
+        with tarfile.open(path_tar, mode_tar) as tar, (path_meta or Path("/dev/null")).open("w") as f_json: # type: ignore[arg-type]
             meta_schemas: list[PackageSchemaMeta] = []
             ApkDumper(stream, tar, meta_schemas).run()
 
@@ -1190,8 +1190,8 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
                 "apk": str(path_apk),
                 "schemas": [asdict(schema) for schema in meta_schemas],
             }
-            json.dump(meta_doc, f_meta, indent=2, sort_keys=True)
-            f_meta.write("\n")
+            json.dump(meta_doc, f_json, indent=2, sort_keys=True)
+            f_json.write("\n")
 
 
 if __name__ == "__main__":
@@ -1208,8 +1208,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("apk", type=Path)
     parser.add_argument("--tar", type=Path, help="Convert the apk into a tar")
-    parser.add_argument("--meta", type=Path, help="Dump the metadata JSON into said file")
+    parser.add_argument("--json", type=Path, help="Dump the info JSON into said file")
     args = parser.parse_args()
 
     logger.info(f"Dumping APK '{args.apk}'")
-    dump(args.apk, args.tar, args.meta)
+    dump(args.apk, args.tar, args.json)
