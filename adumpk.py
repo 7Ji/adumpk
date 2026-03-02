@@ -772,6 +772,8 @@ class TarEmitter:
                 ti.linkname = f["link_target"] or ""
                 ti.size = 0
                 self.tar.addfile(ti)
+            case _:
+                panic(f"Invalid file type to add: {kind}", FormatError)
 
     def add_data_file_stream(self, f: FileEntry, data_len: int, stream: ApkByteStream):
         path = f["path"]
