@@ -280,10 +280,7 @@ class RawApkByteStream(ApkByteStream):
         self._f = f
 
     def read(self, size: int) -> bytes:
-        logger.debug("Raw stream read request: size=%d", size)
-        out = self._f.read(size)
-        logger.debug("Raw stream read result: requested=%d returned=%d", size, len(out))
-        return out
+        return self._f.read(size)
 
 class DeflateApkByteStream(ApkByteStream):
     def __init__(self, f: BinaryIO):
@@ -294,55 +291,19 @@ class DeflateApkByteStream(ApkByteStream):
 
     def _fill(self, size: int):
         while len(self._out) < size and not self._eof:
-            logger.debug(
-                "Deflate _fill loop: target=%d buffered=%d eof=%s",
-                size,
-                len(self._out),
-                self._eof,
-            )
             in_chunk = self._f.read(1024 * 1024)
-            logger.debug("Deflate _fill compressed read: in_bytes=%d", len(in_chunk))
             if not in_chunk:
-                flushed = self._dec.flush()
-                self._out.extend(flushed)
+                self._out.extend(self._dec.flush())
                 self._eof = True
-                logger.debug(
-                    "Deflate _fill EOF: flushed=%d buffered=%d eof=%s",
-                    len(flushed),
-                    len(self._out),
-                    self._eof,
-                )
                 break
-            out_chunk = self._dec.decompress(in_chunk)
-            self._out.extend(out_chunk)
-            logger.debug(
-                "Deflate _fill decompressed: in_bytes=%d out_bytes=%d buffered=%d eof=%s",
-                len(in_chunk),
-                len(out_chunk),
-                len(self._out),
-                self._eof,
-            )
+            self._out.extend(self._dec.decompress(in_chunk))
 
     def read(self, size: int) -> bytes:
-        logger.debug(
-            "Deflate read request: size=%d buffered=%d eof=%s",
-            size,
-            len(self._out),
-            self._eof,
-        )
         if size <= 0:
-            logger.debug("Deflate read result: requested=%d returned=0", size)
             return b""
         self._fill(size)
         out = bytes(self._out[:size])
         del self._out[:len(out)]
-        logger.debug(
-            "Deflate read result: requested=%d returned=%d buffered=%d eof=%s",
-            size,
-            len(out),
-            len(self._out),
-            self._eof,
-        )
         return out
 
 class ZstdApkByteStream(ApkByteStream):
@@ -354,17 +315,8 @@ class ZstdApkByteStream(ApkByteStream):
 
     def _fill(self, size: int):
         while len(self._out) < size and not self._done:
-            logger.debug(
-                "Zstd _fill loop: target=%d buffered=%d done=%s needs_input=%s eof=%s",
-                size,
-                len(self._out),
-                self._done,
-                self._dec.needs_input,
-                self._dec.eof,
-            )
             if self._dec.needs_input:
                 in_chunk = self._f.read(1024 * 1024)
-                logger.debug("Zstd _fill compressed read: in_bytes=%d", len(in_chunk))
                 if not in_chunk:
                     panic("Truncated zstd stream", FormatError)
             else:
@@ -375,48 +327,17 @@ class ZstdApkByteStream(ApkByteStream):
                 self._out.extend(out_chunk)
             elif self._dec.needs_input and not in_chunk:
                 panic("Truncated zstd stream", FormatError)
-            logger.debug(
-                "Zstd _fill decompressed: in_bytes=%d out_bytes=%d buffered=%d needs_input=%s eof=%s",
-                len(in_chunk),
-                len(out_chunk),
-                len(self._out),
-                self._dec.needs_input,
-                self._dec.eof,
-            )
 
             if self._dec.eof:
                 self._done = True
-                logger.debug(
-                    "Zstd _fill EOF: buffered=%d done=%s",
-                    len(self._out),
-                    self._done,
-                )
                 break
 
     def read(self, size: int) -> bytes:
-        logger.debug(
-            "Zstd read request: size=%d buffered=%d done=%s needs_input=%s eof=%s",
-            size,
-            len(self._out),
-            self._done,
-            self._dec.needs_input,
-            self._dec.eof,
-        )
         if size <= 0:
-            logger.debug("Zstd read result: requested=%d returned=0", size)
             return b""
         self._fill(size)
         out = bytes(self._out[:size])
         del self._out[:len(out)]
-        logger.debug(
-            "Zstd read result: requested=%d returned=%d buffered=%d done=%s needs_input=%s eof=%s",
-            size,
-            len(out),
-            len(self._out),
-            self._done,
-            self._dec.needs_input,
-            self._dec.eof,
-        )
         return out
 
 class ApkBodySource:
@@ -1037,13 +958,6 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("apk", type=Path)
-    parser.add_argument("--debug", action="store_true", help="print debug messages")
-    parser.add_argument("--tar", type=Path, help="Convert the apk into a tar")
-    parser.add_argument("--meta", type=Path, help="Dump the metadata JSON into said file")
-    args = parser.parse_args()
-
     logging._levelToName = {
         logging.DEBUG:      '\33[37mDEBUG...\33[0m',
         logging.INFO:       '\33[36mINFO....\33[0m',
@@ -1052,7 +966,13 @@ if __name__ == "__main__":
         logging.FATAL:      '\33[31mFATAL!!!\33[0m',
         logging.NOTSET:            '........',
     }
-    logging.basicConfig(stream=sys.stdout, format="%(levelname)s %(message)s", level=logging.DEBUG if args.debug else logging.INFO)
+    logging.basicConfig(stream=sys.stdout, format="%(levelname)s %(message)s", level=logging.INFO)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("apk", type=Path)
+    parser.add_argument("--tar", type=Path, help="Convert the apk into a tar")
+    parser.add_argument("--meta", type=Path, help="Dump the metadata JSON into said file")
+    args = parser.parse_args()
 
     logger.info(f"Dumping APK '{args.apk}'")
     dump(args.apk, args.tar, args.meta)
