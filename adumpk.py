@@ -414,7 +414,7 @@ class AdbReader:
     def parse_package(self) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]], dict[tuple[int, int], dict[str, object]]]:
         if len(self.adb) < SZ_CADB_HDR:
             panic("ADB payload too small for header", FormatError)
-        hdr = _read_struct(self.adb, 0, CAdbHdr)
+        hdr = CAdbHdr.from_buffer_copy(self.adb, 0)
         pkg = self.read_obj(hdr.root)
 
         metadata = {}
@@ -543,12 +543,6 @@ def _tar_add_data_file(tar: tarfile.TarFile, f: dict[str, object], payload: byte
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
-def _read_struct(buf, offset: int, struct_type: type[ctypes.Structure]):
-    size = ctypes.sizeof(struct_type)
-    if offset + size > len(buf):
-        panic(f"Truncated {struct_type.__name__} at offset {offset}", FormatError)
-    return struct_type.from_buffer_copy(buf, offset)
-
 def _parse_block(buf, offset: int, limit: int) -> tuple[int, int, int, int]:
     if offset + SZ_CU32 > limit:
         panic(f"Truncated block type/size at offset {offset}", FormatError)
@@ -556,7 +550,7 @@ def _parse_block(buf, offset: int, limit: int) -> tuple[int, int, int, int]:
     type_size = Cu32.from_buffer_copy(buf, offset).value
     block_type = type_size >> 30
     if block_type == AdbBlockType.EXT:
-        blk = _read_struct(buf, offset, CAdbBlock)
+        blk = CAdbBlock.from_buffer_copy(buf, offset)
         block_type = type_size & 0x3fffffff
         raw_size = blk.x_size
         hdr_size = SZ_CADB_BLOCK
@@ -593,7 +587,7 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
                     panic("Invalid block order: ADB block after SIG/DATA", FormatError)
                 if payload_size < SZ_CADB_HDR:
                     panic("ADB block payload too small", FormatError)
-                adb_hdr = _read_struct(buf, payload_off, CAdbHdr)
+                adb_hdr = CAdbHdr.from_buffer_copy(buf, payload_off)
                 logger.info(
                     f"  [{index}] ADB payload={payload_size} compat={adb_hdr.adb_compat_ver} ver={adb_hdr.adb_ver}"
                 )
@@ -627,7 +621,7 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
                     panic("Invalid block order: SIG block position", FormatError)
                 if payload_size < SZ_CADB_SIGN_HDR:
                     panic("SIG block payload too small", FormatError)
-                sig = _read_struct(buf, payload_off, CAdbSignHdr)
+                sig = CAdbSignHdr.from_buffer_copy(buf, payload_off)
                 logger.info(
                     f"  [{index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
                 )
@@ -638,7 +632,7 @@ def _dump_blocks(buf, offset: int, limit: int, schema: int, tar: tarfile.TarFile
                 if schema == AdbSchema.PACKAGE:
                     if payload_size < SZ_CADB_DATA_PACKAGE:
                         panic("Package DATA block payload too small", FormatError)
-                    hdr = _read_struct(buf, payload_off, CAdbDataPackage)
+                    hdr = CAdbDataPackage.from_buffer_copy(buf, payload_off)
                     data_len = payload_size - SZ_CADB_DATA_PACKAGE
                     file_info = file_lookup.get((hdr.path_idx, hdr.file_idx))
                     logger.info(
