@@ -4,6 +4,7 @@ import argparse
 import ctypes
 from ctypes import LittleEndianStructure
 from compression import zstd
+from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
 import io
 import json
@@ -12,7 +13,7 @@ from pathlib import PosixPath as Path
 import stat
 import sys
 import tarfile
-from typing import BinaryIO, Literal, NoReturn, Optional, Type, TypedDict
+from typing import BinaryIO, NoReturn, Optional, Type
 import zlib
 
 logger = logging.getLogger(__name__)
@@ -200,14 +201,16 @@ class FileKind(str, Enum):
     SPECIAL = "special"
     UNKNOWN = "unknown"
 
-class DirectoryEntry(TypedDict):
+@dataclass
+class DirectoryEntry:
     path: str
     mode: int
     user: Optional[str]
     group: Optional[str]
     path_idx: int
 
-class FileEntry(TypedDict):
+@dataclass
+class FileEntry:
     path: str
     name: str
     path_idx: int
@@ -221,8 +224,9 @@ class FileEntry(TypedDict):
     link_target: Optional[str]
     device: Optional[int]
 
-class PackageSchemaMeta(TypedDict):
-    schema: Literal["package"]
+@dataclass
+class PackageSchemaMeta:
+    schema: str = field(default="package", init=False)
     metadata: PackageMetadata
     dirs: list[DirectoryEntry]
     files: list[FileEntry]
@@ -658,13 +662,13 @@ class AdbReader:
             path = self.read_obj(path_tag)
             path_name = self.blob_to_text(self.read_blob(self.obj_get(path, AdbDirField.NAME))) or ""
             dmode, duser, dgroup = self._parse_acl(self.obj_get(path, AdbDirField.ACL), 0o755)
-            dirs.append({
-                "path": path_name,
-                "mode": dmode,
-                "user": duser,
-                "group": dgroup,
-                "path_idx": path_idx,
-            })
+            dirs.append(DirectoryEntry(
+                path=path_name,
+                mode=dmode,
+                user=duser,
+                group=dgroup,
+                path_idx=path_idx,
+            ))
             files_tag = self.obj_get(path, AdbDirField.FILES)
             if files_tag == 0:
                 continue
@@ -683,20 +687,20 @@ class AdbReader:
                 fmtime = self.read_int(self.obj_get(file_obj, AdbFileField.MTIME))
                 target_blob = self.read_blob(self.obj_get(file_obj, AdbFileField.TARGET))
                 fkind, flink, fdev = self._parse_target_blob(target_blob)
-                info: FileEntry = {
-                    "path": full,
-                    "name": file_name,
-                    "path_idx": path_idx,
-                    "file_idx": file_idx,
-                    "kind": fkind,
-                    "size": 0 if fsize is None else int(fsize),
-                    "mtime": 0 if fmtime is None else int(fmtime),
-                    "mode": fmode,
-                    "user": fuser,
-                    "group": fgroup,
-                    "link_target": flink,
-                    "device": fdev,
-                }
+                info = FileEntry(
+                    path=full,
+                    name=file_name,
+                    path_idx=path_idx,
+                    file_idx=file_idx,
+                    kind=fkind,
+                    size=0 if fsize is None else int(fsize),
+                    mtime=0 if fmtime is None else int(fmtime),
+                    mode=fmode,
+                    user=fuser,
+                    group=fgroup,
+                    link_target=flink,
+                    device=fdev,
+                )
                 file_entries.append(info)
                 file_lookup[(path_idx, file_idx)] = info
         return metadata, dirs, file_entries, file_lookup
@@ -740,45 +744,45 @@ class TarEmitter:
             self.seen_dirs.add(current)
 
     def add_dir(self, d: DirectoryEntry):
-        path = d["path"]
+        path = d.path
         if not path or path in self.seen_dirs:
             return
         self._add_parent_dirs(path)
-        ti = _tarinfo_base(f"{path}/", d["mode"], 0)
+        ti = _tarinfo_base(f"{path}/", d.mode, 0)
         ti.type = tarfile.DIRTYPE
         ti.size = 0
         self.tar.addfile(ti)
         self.seen_dirs.add(path)
 
     def add_nondata_file(self, f: FileEntry):
-        kind = f["kind"]
-        path = f["path"]
+        kind = f.kind
+        path = f.path
         self._add_parent_dirs(path)
         match kind:
             case FileKind.FILE:
-                if f["size"] == 0:
-                    ti = _tarinfo_base(path, f["mode"], f["mtime"])
+                if f.size == 0:
+                    ti = _tarinfo_base(path, f.mode, f.mtime)
                     ti.size = 0
                     self.tar.addfile(ti, io.BytesIO())
             case FileKind.SYMLINK:
-                ti = _tarinfo_base(path, f["mode"], f["mtime"])
+                ti = _tarinfo_base(path, f.mode, f.mtime)
                 ti.type = tarfile.SYMTYPE
-                ti.linkname = f["link_target"] or ""
+                ti.linkname = f.link_target or ""
                 ti.size = 0
                 self.tar.addfile(ti)
             case FileKind.HARDLINK:
-                ti = _tarinfo_base(path, f["mode"], f["mtime"])
+                ti = _tarinfo_base(path, f.mode, f.mtime)
                 ti.type = tarfile.LNKTYPE
-                ti.linkname = f["link_target"] or ""
+                ti.linkname = f.link_target or ""
                 ti.size = 0
                 self.tar.addfile(ti)
             case _:
                 panic(f"Invalid file type to add: {kind}", FormatError)
 
     def add_data_file_stream(self, f: FileEntry, data_len: int, stream: ApkByteStream):
-        path = f["path"]
+        path = f.path
         self._add_parent_dirs(path)
-        ti = _tarinfo_base(path, f["mode"], f["mtime"])
+        ti = _tarinfo_base(path, f.mode, f.mtime)
         ti.size = data_len
         self.tar.addfile(ti, _TarDataStream(stream, data_len))
 
@@ -840,12 +844,11 @@ class ApkDumper:
                         metadata, dirs, files, file_lookup = AdbReader(
                             adb_payload
                         ).parse_package()
-                        self.meta_schemas.append({
-                            "schema": "package",
-                            "metadata": metadata,
-                            "dirs": dirs,
-                            "files": files,
-                        })
+                        self.meta_schemas.append(PackageSchemaMeta(
+                            metadata=metadata,
+                            dirs=dirs,
+                            files=files,
+                        ))
                         if metadata:
                             logger.info("    package metadata:")
                             for key, value in metadata.items():
@@ -854,7 +857,7 @@ class ApkDumper:
                             logger.info("    package metadata: (none)")
                         logger.info(f"    all file paths ({len(files)}):")
                         for f in files:
-                            logger.info(f"      {f['path']}")
+                            logger.info(f"      {f.path}")
 
                         for d in dirs:
                             self.tar_writer.add_dir(d)
@@ -887,18 +890,18 @@ class ApkDumper:
                         )
                         if file_info is None:
                             panic(f"Unexpected DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
-                        logger.info(f"      path={file_info['path']}")
+                        logger.info(f"      path={file_info.path}")
 
                         key = (hdr.path_idx, hdr.file_idx)
                         if key in written_data:
                             panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
                         written_data.add(key)
 
-                        if file_info["kind"] != FileKind.FILE:
-                            panic(f"DATA block points to non-regular file '{file_info['path']}'", FormatError)
-                        if data_len != file_info["size"]:
+                        if file_info.kind != FileKind.FILE:
+                            panic(f"DATA block points to non-regular file '{file_info.path}'", FormatError)
+                        if data_len != file_info.size:
                             panic(
-                                f"DATA size mismatch for '{file_info['path']}': {data_len} != {file_info['size']}",
+                                f"DATA size mismatch for '{file_info.path}': {data_len} != {file_info.size}",
                                 FormatError,
                             )
                         self.tar_writer.add_data_file_stream(file_info, data_len, self.stream)
@@ -944,12 +947,12 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
 
         with tarfile.open(path_tar, mode_tar) as tar, (path_meta or Path("/dev/null")).open("w") as f_meta: # type: ignore[arg-type]
             meta_schemas: list[PackageSchemaMeta] = []
-            meta_doc: dict[str, str | list[PackageSchemaMeta]] = {
-                "apk": str(path_apk),
-                "schemas": meta_schemas,
-            }
             ApkDumper(stream, tar, meta_schemas).run()
 
+            meta_doc: dict[str, str | list[dict[str, object]]] = {
+                "apk": str(path_apk),
+                "schemas": [asdict(schema) for schema in meta_schemas],
+            }
             json.dump(meta_doc, f_meta, indent=2, sort_keys=True)
             f_meta.write("\n")
 
