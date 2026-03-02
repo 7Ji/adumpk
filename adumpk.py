@@ -12,7 +12,6 @@ from pathlib import PosixPath as Path
 import stat
 import sys
 import tarfile
-import tempfile
 from typing import BinaryIO, Literal, NoReturn, Optional, Type, TypedDict
 import zlib
 
@@ -699,60 +698,6 @@ def _tarinfo_base(name: str, mode: int, mtime: int) -> tarfile.TarInfo:
     ti.mtime = int(mtime)
     return ti
 
-def _tar_add_parent_dirs(tar: tarfile.TarFile, path: str, seen_dirs: set[str]):
-    parts = Path(path).parts[:-1]
-    current = ""
-    for part in parts:
-        current = f"{current}/{part}" if current else part
-        if current in seen_dirs:
-            continue
-        ti = _tarinfo_base(f"{current}/", 0o755, 0)
-        ti.type = tarfile.DIRTYPE
-        ti.size = 0
-        tar.addfile(ti)
-        seen_dirs.add(current)
-
-def _tar_add_dir(tar: tarfile.TarFile, d: DirectoryEntry, seen_dirs: set[str]):
-    path = d["path"]
-    if not path or path in seen_dirs:
-        return
-    _tar_add_parent_dirs(tar, path, seen_dirs)
-    ti = _tarinfo_base(f"{path}/", d["mode"], 0)
-    ti.type = tarfile.DIRTYPE
-    ti.size = 0
-    tar.addfile(ti)
-    seen_dirs.add(path)
-
-def _tar_add_nondata_file(tar: tarfile.TarFile, f: FileEntry, seen_dirs: set[str]):
-    kind = f["kind"]
-    path = f["path"]
-    _tar_add_parent_dirs(tar, path, seen_dirs)
-    if kind == "file" and f["size"] == 0:
-        ti = _tarinfo_base(path, f["mode"], f["mtime"])
-        ti.size = 0
-        tar.addfile(ti, io.BytesIO())
-        return
-    if kind == "symlink":
-        ti = _tarinfo_base(path, f["mode"], f["mtime"])
-        ti.type = tarfile.SYMTYPE
-        ti.linkname = f["link_target"] or ""
-        ti.size = 0
-        tar.addfile(ti)
-        return
-    if kind == "hardlink":
-        ti = _tarinfo_base(path, f["mode"], f["mtime"])
-        ti.type = tarfile.LNKTYPE
-        ti.linkname = f["link_target"] or ""
-        ti.size = 0
-        tar.addfile(ti)
-
-def _tar_add_data_file(tar: tarfile.TarFile, f: FileEntry, payload: bytes, seen_dirs: set[str]):
-    path = f["path"]
-    _tar_add_parent_dirs(tar, path, seen_dirs)
-    ti = _tarinfo_base(path, f["mode"], f["mtime"])
-    ti.size = len(payload)
-    tar.addfile(ti, io.BytesIO(payload))
-
 class _TarDataStream:
     def __init__(self, stream: ApkByteStream, size: int):
         self._stream = stream
@@ -767,18 +712,64 @@ class _TarDataStream:
         self._remaining -= len(data)
         return data
 
-def _tar_add_data_file_stream(
-    tar: tarfile.TarFile,
-    f: FileEntry,
-    data_len: int,
-    stream: ApkByteStream,
-    seen_dirs: set[str],
-):
-    path = f["path"]
-    _tar_add_parent_dirs(tar, path, seen_dirs)
-    ti = _tarinfo_base(path, f["mode"], f["mtime"])
-    ti.size = data_len
-    tar.addfile(ti, _TarDataStream(stream, data_len))
+class TarEmitter:
+    def __init__(self, tar: tarfile.TarFile):
+        self.tar = tar
+        self.seen_dirs: set[str] = set()
+
+    def _add_parent_dirs(self, path: str):
+        parts = Path(path).parts[:-1]
+        current = ""
+        for part in parts:
+            current = f"{current}/{part}" if current else part
+            if current in self.seen_dirs:
+                continue
+            ti = _tarinfo_base(f"{current}/", 0o755, 0)
+            ti.type = tarfile.DIRTYPE
+            ti.size = 0
+            self.tar.addfile(ti)
+            self.seen_dirs.add(current)
+
+    def add_dir(self, d: DirectoryEntry):
+        path = d["path"]
+        if not path or path in self.seen_dirs:
+            return
+        self._add_parent_dirs(path)
+        ti = _tarinfo_base(f"{path}/", d["mode"], 0)
+        ti.type = tarfile.DIRTYPE
+        ti.size = 0
+        self.tar.addfile(ti)
+        self.seen_dirs.add(path)
+
+    def add_nondata_file(self, f: FileEntry):
+        kind = f["kind"]
+        path = f["path"]
+        self._add_parent_dirs(path)
+        if kind == "file" and f["size"] == 0:
+            ti = _tarinfo_base(path, f["mode"], f["mtime"])
+            ti.size = 0
+            self.tar.addfile(ti, io.BytesIO())
+            return
+        if kind == "symlink":
+            ti = _tarinfo_base(path, f["mode"], f["mtime"])
+            ti.type = tarfile.SYMTYPE
+            ti.linkname = f["link_target"] or ""
+            ti.size = 0
+            self.tar.addfile(ti)
+            return
+        if kind == "hardlink":
+            ti = _tarinfo_base(path, f["mode"], f["mtime"])
+            ti.type = tarfile.LNKTYPE
+            ti.linkname = f["link_target"] or ""
+            ti.size = 0
+            self.tar.addfile(ti)
+
+    def add_data_file_stream(self, f: FileEntry, data_len: int, stream: ApkByteStream):
+        path = f["path"]
+        self._add_parent_dirs(path)
+        ti = _tarinfo_base(path, f["mode"], f["mtime"])
+        ti.size = data_len
+        self.tar.addfile(ti, _TarDataStream(stream, data_len))
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
@@ -812,7 +803,7 @@ def _dump_blocks(stream: ApkByteStream, schema: int, tar: tarfile.TarFile, meta_
     seen_data = False
     file_lookup: dict[tuple[int, int], FileEntry] = {}
     written_data: set[tuple[int, int]] = set()
-    seen_dirs: set[str] = set()
+    tar_writer = TarEmitter(tar)
     index = 0
 
     while True:
@@ -853,9 +844,9 @@ def _dump_blocks(stream: ApkByteStream, schema: int, tar: tarfile.TarFile, meta_
                         logger.info(f"      {f['path']}")
 
                     for d in dirs:
-                        _tar_add_dir(tar, d, seen_dirs)
+                        tar_writer.add_dir(d)
                     for f in files:
-                        _tar_add_nondata_file(tar, f, seen_dirs)
+                        tar_writer.add_nondata_file(f)
                 seen_adb = True
             case AdbBlockType.SIG:
                 if not seen_adb or seen_data:
@@ -897,7 +888,7 @@ def _dump_blocks(stream: ApkByteStream, schema: int, tar: tarfile.TarFile, meta_
                             f"DATA size mismatch for '{file_info['path']}': {data_len} != {file_info['size']}",
                             FormatError,
                         )
-                    _tar_add_data_file_stream(tar, file_info, data_len, stream, seen_dirs)
+                    tar_writer.add_data_file_stream(file_info, data_len, stream)
                 else:
                     logger.info(f"  [{index}] DATA payload={payload_size}")
                     stream.skip(payload_size, "DATA payload")
