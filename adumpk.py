@@ -771,133 +771,154 @@ class TarEmitter:
         ti.size = data_len
         self.tar.addfile(ti, _TarDataStream(stream, data_len))
 
-def _parse_block(stream: ApkByteStream) -> Optional[tuple[int, int, int]]:
-    type_size_raw = stream.read_exact_or_none(SZ_CU32, "block type/size")
-    if type_size_raw is None:
-        return None
+class ApkDumper:
+    def __init__(self, stream: ApkByteStream, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]):
+        self.stream = stream
+        self.tar_writer = TarEmitter(tar)
+        self.meta_schemas = meta_schemas
 
-    type_size = Cu32.from_buffer_copy(type_size_raw, 0).value
-    block_type = type_size >> 30
-    if block_type == AdbBlockType.EXT:
-        ext = stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
-        blk = CAdbBlock.from_buffer_copy(type_size_raw + ext, 0)
-        block_type = type_size & 0x3fffffff
-        raw_size = blk.x_size
-        hdr_size = SZ_CADB_BLOCK
-    else:
-        raw_size = type_size & 0x3fffffff
-        hdr_size = SZ_CU32
+    def _parse_block(self) -> Optional[tuple[int, int, int]]:
+        type_size_raw = self.stream.read_exact_or_none(SZ_CU32, "block type/size")
+        if type_size_raw is None:
+            return None
 
-    if raw_size < hdr_size:
-        panic(f"Invalid block raw size {raw_size}", FormatError)
+        type_size = Cu32.from_buffer_copy(type_size_raw, 0).value
+        block_type = type_size >> 30
+        if block_type == AdbBlockType.EXT:
+            ext = self.stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
+            blk = CAdbBlock.from_buffer_copy(type_size_raw + ext, 0)
+            block_type = type_size & 0x3fffffff
+            raw_size = blk.x_size
+            hdr_size = SZ_CADB_BLOCK
+        else:
+            raw_size = type_size & 0x3fffffff
+            hdr_size = SZ_CU32
 
-    payload_size = raw_size - hdr_size
-    pad_size = ((raw_size + 8 - 1) // 8 * 8) - raw_size
-    return block_type, payload_size, pad_size
+        if raw_size < hdr_size:
+            panic(f"Invalid block raw size {raw_size}", FormatError)
 
-def _dump_blocks(stream: ApkByteStream, schema: int, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]):
-    seen_adb = False
-    seen_data = False
-    file_lookup: dict[tuple[int, int], FileEntry] = {}
-    written_data: set[tuple[int, int]] = set()
-    tar_writer = TarEmitter(tar)
-    index = 0
+        payload_size = raw_size - hdr_size
+        pad_size = ((raw_size + 8 - 1) // 8 * 8) - raw_size
+        return block_type, payload_size, pad_size
 
-    while True:
-        blk = _parse_block(stream)
-        if blk is None:
-            break
-        block_type, payload_size, pad_size = blk
+    def _dump_blocks(self, schema: int):
+        seen_adb = False
+        seen_data = False
+        file_lookup: dict[tuple[int, int], FileEntry] = {}
+        written_data: set[tuple[int, int]] = set()
+        index = 0
 
-        match block_type:
-            case AdbBlockType.ADB:
-                if seen_adb or seen_data:
-                    panic("Invalid block order: ADB block after SIG/DATA", FormatError)
-                if payload_size < SZ_CADB_HDR:
-                    panic("ADB block payload too small", FormatError)
-                adb_payload = stream.read_exact(payload_size, "ADB block payload")
-                adb_hdr = CAdbHdr.from_buffer_copy(adb_payload, 0)
-                logger.info(
-                    f"  [{index}] ADB payload={payload_size} compat={adb_hdr.adb_compat_ver} ver={adb_hdr.adb_ver}"
-                )
-                if schema == AdbSchema.PACKAGE:
-                    metadata, dirs, files, file_lookup = AdbReader(
-                        adb_payload
-                    ).parse_package()
-                    meta_schemas.append({
-                        "schema": "package",
-                        "metadata": metadata,
-                        "dirs": dirs,
-                        "files": files,
-                    })
-                    if metadata:
-                        logger.info("    package metadata:")
-                        for key, value in metadata.items():
-                            logger.info(f"      {key}: {value}")
-                    else:
-                        logger.info("    package metadata: (none)")
-                    logger.info(f"    all file paths ({len(files)}):")
-                    for f in files:
-                        logger.info(f"      {f['path']}")
+        while True:
+            blk = self._parse_block()
+            if blk is None:
+                break
+            block_type, payload_size, pad_size = blk
 
-                    for d in dirs:
-                        tar_writer.add_dir(d)
-                    for f in files:
-                        tar_writer.add_nondata_file(f)
-                seen_adb = True
-            case AdbBlockType.SIG:
-                if not seen_adb or seen_data:
-                    panic("Invalid block order: SIG block position", FormatError)
-                if payload_size < SZ_CADB_SIGN_HDR:
-                    panic("SIG block payload too small", FormatError)
-                sig_payload = stream.read_exact(payload_size, "SIG block payload")
-                sig = CAdbSignHdr.from_buffer_copy(sig_payload, 0)
-                logger.info(
-                    f"  [{index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
-                )
-            case AdbBlockType.DATA:
-                if not seen_adb:
-                    panic("Invalid block order: DATA before ADB", FormatError)
-                seen_data = True
-                if schema == AdbSchema.PACKAGE:
-                    if payload_size < SZ_CADB_DATA_PACKAGE:
-                        panic("Package DATA block payload too small", FormatError)
-                    data_hdr = stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
-                    hdr = CAdbDataPackage.from_buffer_copy(data_hdr, 0)
-                    data_len = payload_size - SZ_CADB_DATA_PACKAGE
-                    file_info = file_lookup.get((hdr.path_idx, hdr.file_idx))
+            match block_type:
+                case AdbBlockType.ADB:
+                    if seen_adb or seen_data:
+                        panic("Invalid block order: ADB block after SIG/DATA", FormatError)
+                    if payload_size < SZ_CADB_HDR:
+                        panic("ADB block payload too small", FormatError)
+                    adb_payload = self.stream.read_exact(payload_size, "ADB block payload")
+                    adb_hdr = CAdbHdr.from_buffer_copy(adb_payload, 0)
                     logger.info(
-                        f"  [{index}] DATA path_idx={hdr.path_idx} file_idx={hdr.file_idx} data_len={data_len}"
+                        f"  [{index}] ADB payload={payload_size} compat={adb_hdr.adb_compat_ver} ver={adb_hdr.adb_ver}"
                     )
-                    if file_info is None:
-                        panic(f"Unexpected DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
-                    logger.info(f"      path={file_info['path']}")
+                    if schema == AdbSchema.PACKAGE:
+                        metadata, dirs, files, file_lookup = AdbReader(
+                            adb_payload
+                        ).parse_package()
+                        self.meta_schemas.append({
+                            "schema": "package",
+                            "metadata": metadata,
+                            "dirs": dirs,
+                            "files": files,
+                        })
+                        if metadata:
+                            logger.info("    package metadata:")
+                            for key, value in metadata.items():
+                                logger.info(f"      {key}: {value}")
+                        else:
+                            logger.info("    package metadata: (none)")
+                        logger.info(f"    all file paths ({len(files)}):")
+                        for f in files:
+                            logger.info(f"      {f['path']}")
 
-                    key = (hdr.path_idx, hdr.file_idx)
-                    if key in written_data:
-                        panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
-                    written_data.add(key)
-
-                    if file_info["kind"] != "file":
-                        panic(f"DATA block points to non-regular file '{file_info['path']}'", FormatError)
-                    if data_len != file_info["size"]:
-                        panic(
-                            f"DATA size mismatch for '{file_info['path']}': {data_len} != {file_info['size']}",
-                            FormatError,
+                        for d in dirs:
+                            self.tar_writer.add_dir(d)
+                        for f in files:
+                            self.tar_writer.add_nondata_file(f)
+                    seen_adb = True
+                case AdbBlockType.SIG:
+                    if not seen_adb or seen_data:
+                        panic("Invalid block order: SIG block position", FormatError)
+                    if payload_size < SZ_CADB_SIGN_HDR:
+                        panic("SIG block payload too small", FormatError)
+                    sig_payload = self.stream.read_exact(payload_size, "SIG block payload")
+                    sig = CAdbSignHdr.from_buffer_copy(sig_payload, 0)
+                    logger.info(
+                        f"  [{index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
+                    )
+                case AdbBlockType.DATA:
+                    if not seen_adb:
+                        panic("Invalid block order: DATA before ADB", FormatError)
+                    seen_data = True
+                    if schema == AdbSchema.PACKAGE:
+                        if payload_size < SZ_CADB_DATA_PACKAGE:
+                            panic("Package DATA block payload too small", FormatError)
+                        data_hdr = self.stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
+                        hdr = CAdbDataPackage.from_buffer_copy(data_hdr, 0)
+                        data_len = payload_size - SZ_CADB_DATA_PACKAGE
+                        file_info = file_lookup.get((hdr.path_idx, hdr.file_idx))
+                        logger.info(
+                            f"  [{index}] DATA path_idx={hdr.path_idx} file_idx={hdr.file_idx} data_len={data_len}"
                         )
-                    tar_writer.add_data_file_stream(file_info, data_len, stream)
-                else:
-                    logger.info(f"  [{index}] DATA payload={payload_size}")
-                    stream.skip(payload_size, "DATA payload")
-            case _:
-                panic(f"Unknown block type {block_type}", FormatError)
+                        if file_info is None:
+                            panic(f"Unexpected DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
+                        logger.info(f"      path={file_info['path']}")
 
-        if pad_size:
-            stream.skip(pad_size, "block padding")
-        index += 1
+                        key = (hdr.path_idx, hdr.file_idx)
+                        if key in written_data:
+                            panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
+                        written_data.add(key)
 
-    if not seen_adb:
-        panic("ADB stream did not contain an ADB block", FormatError)
+                        if file_info["kind"] != "file":
+                            panic(f"DATA block points to non-regular file '{file_info['path']}'", FormatError)
+                        if data_len != file_info["size"]:
+                            panic(
+                                f"DATA size mismatch for '{file_info['path']}': {data_len} != {file_info['size']}",
+                                FormatError,
+                            )
+                        self.tar_writer.add_data_file_stream(file_info, data_len, self.stream)
+                    else:
+                        logger.info(f"  [{index}] DATA payload={payload_size}")
+                        self.stream.skip(payload_size, "DATA payload")
+                case _:
+                    panic(f"Unknown block type {block_type}", FormatError)
+
+            if pad_size:
+                self.stream.skip(pad_size, "block padding")
+            index += 1
+
+        if not seen_adb:
+            panic("ADB stream did not contain an ADB block", FormatError)
+
+    def run(self):
+        while True:
+            schema_raw = self.stream.read_exact_or_none(SZ_CADB_SCHEMA, "schema")
+            if schema_raw is None:
+                break
+            schema = CAdbSchema.from_buffer_copy(schema_raw, 0).value
+
+            match schema:
+                case AdbSchema.PACKAGE:
+                    logger.info("Schema: package")
+                    self._dump_blocks(schema)
+                case AdbSchema.INDEX:
+                    panic("Schema for index is not supported yet", NotImplementedError)
+                case _:
+                    panic(f"Unknown schema {schema:#x}", FormatError)
 
 def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
     with ApkBodySource.open(path_apk) as src:
@@ -916,21 +937,7 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
                 "apk": str(path_apk),
                 "schemas": meta_schemas,
             }
-
-            while True:
-                schema_raw = stream.read_exact_or_none(SZ_CADB_SCHEMA, "schema")
-                if schema_raw is None:
-                    break
-                schema = CAdbSchema.from_buffer_copy(schema_raw, 0).value
-
-                match schema:
-                    case AdbSchema.PACKAGE:
-                        logger.info("Schema: package")
-                        _dump_blocks(stream, schema, tar, meta_schemas)
-                    case AdbSchema.INDEX:
-                        panic("Schema for index is not supported yet", NotImplementedError)
-                    case _:
-                        panic(f"Unknown schema {schema:#x}", FormatError)
+            ApkDumper(stream, tar, meta_schemas).run()
 
             json.dump(meta_doc, f_meta, indent=2, sort_keys=True)
             f_meta.write("\n")
