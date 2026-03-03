@@ -212,7 +212,7 @@ class FileKind(StrEnum):
     FIFO = "fifo"
     UNKNOWN = "unknown"
 
-@dataclass
+@dataclass(frozen=True)
 class DirectoryEntry:
     path: str
     mode: int
@@ -221,13 +221,13 @@ class DirectoryEntry:
     path_idx: int
     xattrs: list["XattrEntry"] = field(default_factory=list)
 
-@dataclass
+@dataclass(frozen=True)
 class XattrEntry:
     name: str
     value_hex: str
     value_text: Optional[str]
 
-@dataclass
+@dataclass(frozen=True)
 class FileEntry:
     path: str
     name: str
@@ -245,7 +245,7 @@ class FileEntry:
     hash_alg: Optional[str] = None
     hash_hex: Optional[str] = None
 
-@dataclass
+@dataclass(frozen=True)
 class PackageSchemaMeta:
     schema: str = field(default="package", init=False)
     metadata: PackageMetadata
