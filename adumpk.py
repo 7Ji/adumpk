@@ -890,35 +890,39 @@ class TarEmitter:
             ti.pax_headers = pax_headers
         return ti
 
-    def _resolve_uid(self, user: Optional[str]) -> int:
-        return self.USER_TO_UID.get(user, 0) if user else 0
+    @classmethod
+    def _resolve_uid(cls, user: Optional[str]) -> int:
+        return cls.USER_TO_UID.get(user, 0) if user else 0
 
-    def _resolve_gid(self, group: Optional[str]) -> int:
-        return self.GROUP_TO_GID.get(group, 0) if group else 0
+    @classmethod
+    def _resolve_gid(cls, group: Optional[str]) -> int:
+        return cls.GROUP_TO_GID.get(group, 0) if group else 0
 
+    @classmethod
     def _build_pax_headers(
-        self,
+        cls,
         xattrs: list[XattrEntry],
         hash_alg: Optional[str] = None,
         hash_hex: Optional[str] = None,
     ) -> dict[str, str]:
         headers: dict[str, str] = {}
         for x in xattrs:
-            key = self._safe_pax_component(x.name)
+            key = cls._safe_pax_component(x.name)
             headers[f"SCHILY.xattr.{key}"] = x.value_text if x.value_text is not None else f"hex:{x.value_hex}"
         if hash_hex and hash_alg:
             headers[f"APK-TOOLS.checksum.{hash_alg}"] = hash_hex
         return headers
 
-    def _tarinfo_file(self, f: FileEntry, pax_headers: dict[str, str]) -> tarfile.TarInfo:
-        return self._tarinfo_base(
+    @classmethod
+    def _tarinfo_file(cls, f: FileEntry, pax_headers: dict[str, str]) -> tarfile.TarInfo:
+        return cls._tarinfo_base(
             f.path,
             f.mode,
             f.mtime,
             user=f.user,
             group=f.group,
-            uid=self._resolve_uid(f.user),
-            gid=self._resolve_gid(f.group),
+            uid=cls._resolve_uid(f.user),
+            gid=cls._resolve_gid(f.group),
             pax_headers=pax_headers,
         )
 
