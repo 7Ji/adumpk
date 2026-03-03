@@ -830,29 +830,6 @@ class AdbReader:
                 file_lookup[(path_idx, file_idx)] = info
         return metadata, dirs, file_entries, file_lookup
 
-def _tarinfo_base(
-    name: str,
-    mode: int,
-    mtime: int,
-    user: Optional[str] = None,
-    group: Optional[str] = None,
-    uid: int = 0,
-    gid: int = 0,
-    pax_headers: Optional[dict[str, str]] = None,
-) -> tarfile.TarInfo:
-    ti = tarfile.TarInfo(name=name)
-    ti.mode = mode & 0o7777
-    ti.mtime = int(mtime)
-    ti.uid = int(uid)
-    ti.gid = int(gid)
-    if user:
-        ti.uname = user
-    if group:
-        ti.gname = group
-    if pax_headers:
-        ti.pax_headers = pax_headers
-    return ti
-
 class _TarDataStream:
     def __init__(self, stream: ApkByteStream, size: int):
         self._stream = stream
@@ -889,6 +866,30 @@ class TarEmitter:
             return name
         return f"hex:{name.encode('utf-8', errors='replace').hex()}"
 
+    @staticmethod
+    def _tarinfo_base(
+        name: str,
+        mode: int,
+        mtime: int,
+        user: Optional[str] = None,
+        group: Optional[str] = None,
+        uid: int = 0,
+        gid: int = 0,
+        pax_headers: Optional[dict[str, str]] = None,
+    ) -> tarfile.TarInfo:
+        ti = tarfile.TarInfo(name=name)
+        ti.mode = mode & 0o7777
+        ti.mtime = int(mtime)
+        ti.uid = int(uid)
+        ti.gid = int(gid)
+        if user:
+            ti.uname = user
+        if group:
+            ti.gname = group
+        if pax_headers:
+            ti.pax_headers = pax_headers
+        return ti
+
     def _resolve_uid(self, user: Optional[str]) -> int:
         return self.USER_TO_UID.get(user, 0) if user else 0
 
@@ -909,6 +910,18 @@ class TarEmitter:
             headers[f"APK-TOOLS.checksum.{hash_alg}"] = hash_hex
         return headers
 
+    def _tarinfo_file(self, f: FileEntry, pax_headers: dict[str, str]) -> tarfile.TarInfo:
+        return self._tarinfo_base(
+            f.path,
+            f.mode,
+            f.mtime,
+            user=f.user,
+            group=f.group,
+            uid=self._resolve_uid(f.user),
+            gid=self._resolve_gid(f.group),
+            pax_headers=pax_headers,
+        )
+
     def _add_parent_dirs(self, path: str):
         parts = Path(path).parts[:-1]
         current = ""
@@ -916,7 +929,7 @@ class TarEmitter:
             current = f"{current}/{part}" if current else part
             if current in self.seen_dirs:
                 continue
-            ti = _tarinfo_base(f"{current}/", 0o755, 0, user="root", group="root", uid=0, gid=0)
+            ti = self._tarinfo_base(f"{current}/", 0o755, 0, user="root", group="root", uid=0, gid=0)
             ti.type = tarfile.DIRTYPE
             ti.size = 0
             self.tar.addfile(ti)
@@ -927,7 +940,7 @@ class TarEmitter:
         if not path or path in self.seen_dirs:
             return
         self._add_parent_dirs(path)
-        ti = _tarinfo_base(
+        ti = self._tarinfo_base(
             f"{path}/",
             d.mode,
             0,
@@ -954,44 +967,17 @@ class TarEmitter:
         match kind:
             case FileKind.FILE:
                 if f.size == 0:
-                    ti = _tarinfo_base(
-                        path,
-                        f.mode,
-                        f.mtime,
-                        user=f.user,
-                        group=f.group,
-                        uid=self._resolve_uid(f.user),
-                        gid=self._resolve_gid(f.group),
-                        pax_headers=pax_headers,
-                    )
+                    ti = self._tarinfo_file(f, pax_headers)
                     ti.size = 0
                     self.tar.addfile(ti, io.BytesIO())
             case FileKind.SYMLINK:
-                ti = _tarinfo_base(
-                    path,
-                    f.mode,
-                    f.mtime,
-                    user=f.user,
-                    group=f.group,
-                    uid=self._resolve_uid(f.user),
-                    gid=self._resolve_gid(f.group),
-                    pax_headers=pax_headers,
-                )
+                ti = self._tarinfo_file(f, pax_headers)
                 ti.type = tarfile.SYMTYPE
                 ti.linkname = f.link_target or ""
                 ti.size = 0
                 self.tar.addfile(ti)
             case FileKind.HARDLINK:
-                ti = _tarinfo_base(
-                    path,
-                    f.mode,
-                    f.mtime,
-                    user=f.user,
-                    group=f.group,
-                    uid=self._resolve_uid(f.user),
-                    gid=self._resolve_gid(f.group),
-                    pax_headers=pax_headers,
-                )
+                ti = self._tarinfo_file(f, pax_headers)
                 ti.type = tarfile.LNKTYPE
                 ti.linkname = f.link_target or ""
                 ti.size = 0
@@ -999,16 +985,7 @@ class TarEmitter:
             case FileKind.BLOCK:
                 if f.device is None:
                     panic(f"BLOCK file missing device number: '{path}'", FormatError)
-                ti = _tarinfo_base(
-                    path,
-                    f.mode,
-                    f.mtime,
-                    user=f.user,
-                    group=f.group,
-                    uid=self._resolve_uid(f.user),
-                    gid=self._resolve_gid(f.group),
-                    pax_headers=pax_headers,
-                )
+                ti = self._tarinfo_file(f, pax_headers)
                 ti.type = tarfile.BLKTYPE
                 ti.devmajor = os.major(f.device)
                 ti.devminor = os.minor(f.device)
@@ -1017,32 +994,14 @@ class TarEmitter:
             case FileKind.CHAR:
                 if f.device is None:
                     panic(f"CHAR file missing device number: '{path}'", FormatError)
-                ti = _tarinfo_base(
-                    path,
-                    f.mode,
-                    f.mtime,
-                    user=f.user,
-                    group=f.group,
-                    uid=self._resolve_uid(f.user),
-                    gid=self._resolve_gid(f.group),
-                    pax_headers=pax_headers,
-                )
+                ti = self._tarinfo_file(f, pax_headers)
                 ti.type = tarfile.CHRTYPE
                 ti.devmajor = os.major(f.device)
                 ti.devminor = os.minor(f.device)
                 ti.size = 0
                 self.tar.addfile(ti)
             case FileKind.FIFO:
-                ti = _tarinfo_base(
-                    path,
-                    f.mode,
-                    f.mtime,
-                    user=f.user,
-                    group=f.group,
-                    uid=self._resolve_uid(f.user),
-                    gid=self._resolve_gid(f.group),
-                    pax_headers=pax_headers,
-                )
+                ti = self._tarinfo_file(f, pax_headers)
                 ti.type = tarfile.FIFOTYPE
                 ti.size = 0
                 self.tar.addfile(ti)
@@ -1050,17 +1009,10 @@ class TarEmitter:
                 panic(f"Invalid file type to add: {kind}", FormatError)
 
     def add_data_file_stream(self, f: FileEntry, data_len: int, stream: ApkByteStream):
-        path = f.path
-        self._add_parent_dirs(path)
-        ti = _tarinfo_base(
-            path,
-            f.mode,
-            f.mtime,
-            user=f.user,
-            group=f.group,
-            uid=self._resolve_uid(f.user),
-            gid=self._resolve_gid(f.group),
-            pax_headers=self._build_pax_headers(
+        self._add_parent_dirs(f.path)
+        ti = self._tarinfo_file(
+            f,
+            self._build_pax_headers(
                 f.xattrs,
                 hash_alg=f.hash_alg,
                 hash_hex=f.hash_hex,
