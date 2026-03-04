@@ -1188,20 +1188,18 @@ class ApkDumper:
             panic(f"Unknown block type {blk.block_type}", FormatError)
 
     def run(self):
-        while True:
-            schema_raw = self.stream.read_exact_or_none(SZ_CADB_SCHEMA, "schema")
-            if schema_raw is None:
-                break
-            schema = CAdbSchema.from_buffer_copy(schema_raw).value
+        schema = CAdbSchema.from_buffer_copy(
+            self.stream.read_exact(SZ_CADB_SCHEMA, "schema")
+        ).value
 
-            match schema:
-                case AdbSchema.PACKAGE:
-                    logger.info("Schema: package")
-                    self._handle_package()
-                case AdbSchema.INDEX:
-                    panic("Schema for index is not supported yet", NotImplementedError)
-                case _:
-                    panic(f"Unknown schema {schema:#x}", FormatError)
+        match schema:
+            case AdbSchema.PACKAGE:
+                logger.info("Schema: package")
+                self._handle_package()
+            case AdbSchema.INDEX:
+                panic("Schema for index is not supported yet", NotImplementedError)
+            case _:
+                panic(f"Unknown schema {schema:#x}", FormatError)
 
 def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
     with ApkBodySource.open(path_apk) as src:
