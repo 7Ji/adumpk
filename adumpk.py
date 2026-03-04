@@ -68,47 +68,6 @@ class AdbPkgField(AdbField):
     PKGINFO = 1
     PATHS = 2
 
-class AdbPkgInfoField(AdbField):
-    HASHES = 3
-    DEPENDS = 15
-    PROVIDES = 16
-    REPLACES = 17
-    INSTALL_IF = 18
-    RECOMMENDS = 19
-    TAGS = 21
-    REPO_COMMIT = 10
-
-class AdbDirField(AdbField):
-    NAME = 1
-    ACL = 2
-    FILES = 3
-
-class AdbFileField(AdbField):
-    NAME = 1
-    ACL = 2
-    SIZE = 3
-    MTIME = 4
-    HASHES = 5
-    TARGET = 6
-
-class AdbDepField(AdbField):
-    NAME = 1
-    VERSION = 2
-    MATCH = 3
-
-class AdbAclField(AdbField):
-    MODE = 1
-    USER = 2
-    GROUP = 3
-    XATTRS = 4
-
-class ApkVersionFlag(IntEnum):
-    EQUAL = 1
-    LESS = 2
-    GREATER = 4
-    FUZZY = 8
-    CONFLICT = 16
-
 class AdbPkgInfoType(IntEnum):
     NAME = 1
     VERSION = 2
@@ -158,6 +117,37 @@ class AdbPkgInfoType(IntEnum):
             "layer",
             "tags",
         )[self - 1]
+
+class AdbDirField(AdbField):
+    NAME = 1
+    ACL = 2
+    FILES = 3
+
+class AdbFileField(AdbField):
+    NAME = 1
+    ACL = 2
+    SIZE = 3
+    MTIME = 4
+    HASHES = 5
+    TARGET = 6
+
+class AdbDepField(AdbField):
+    NAME = 1
+    VERSION = 2
+    MATCH = 3
+
+class AdbAclField(AdbField):
+    MODE = 1
+    USER = 2
+    GROUP = 3
+    XATTRS = 4
+
+class ApkVersionFlag(IntEnum):
+    EQUAL = 1
+    LESS = 2
+    GREATER = 4
+    FUZZY = 8
+    CONFLICT = 16
 
 # C type aliases
 Cu8 = ctypes.c_uint8
@@ -489,15 +479,15 @@ class ApkBodySource:
 
 class AdbReader:
     PKGINFO_DEP_FIELDS = {
-        int(AdbPkgInfoField.DEPENDS),
-        int(AdbPkgInfoField.PROVIDES),
-        int(AdbPkgInfoField.REPLACES),
-        int(AdbPkgInfoField.INSTALL_IF),
-        int(AdbPkgInfoField.RECOMMENDS),
+        int(AdbPkgInfoType.DEPENDS),
+        int(AdbPkgInfoType.PROVIDES),
+        int(AdbPkgInfoType.REPLACES),
+        int(AdbPkgInfoType.INSTALL_IF),
+        int(AdbPkgInfoType.RECOMMENDS),
     }
     PKGINFO_HEX_FIELDS = {
-        int(AdbPkgInfoField.HASHES),
-        int(AdbPkgInfoField.REPO_COMMIT),
+        int(AdbPkgInfoType.HASHES),
+        int(AdbPkgInfoType.REPO_COMMIT),
     }
     DEP_OP_MAP = {
         int(ApkVersionFlag.LESS): "<",
@@ -655,7 +645,7 @@ class AdbReader:
             if idx in self.PKGINFO_DEP_FIELDS:
                 meta[name] = self._parse_dep_array(tag)
                 continue
-            if idx == int(AdbPkgInfoField.TAGS):
+            if idx == int(AdbPkgInfoType.TAGS):
                 meta[name] = self._parse_string_array(tag)
                 continue
             ival = self.read_int(tag)
