@@ -1,9 +1,11 @@
 # adumpk
 
-`adumpk.py` parses Alpine APK v3 ADB package files (used in OpenWrt 25.10 and above) and can optionally:
+`adumpk.py` parses Alpine APK v3 ADB package files (used in OpenWrt 25.12 and above) and can optionally:
 
 - convert package contents to a tar archive
 - write parsed package metadata to JSON
+
+The definition of the ADB format is loosely defined by some schemas, and in most cases largely depends on the only implementation `apk-tools`' C source code. I've written a single blog post [Into Alpine APK v3 format: the binary perspective](https://7ji.github.io/designdoc/2026/03/03/into-Alpine-APK-v3-format-the-binary-perspective.html) about how to dig through such format which should be easier to follow.
 
 ## Usage
 
