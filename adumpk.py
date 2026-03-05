@@ -143,11 +143,11 @@ class AdbAclField(AdbField):
     XATTRS = 4
 
 class ApkVersionFlag(IntEnum):
-    EQUAL    = 1
-    LESS     = 2
-    GREATER  = 4
-    FUZZY    = 8
-    CONFLICT = 16
+    EQUAL    = 0b00001 # 1 << 0
+    LESS     = 0b00010 # 1 << 1
+    GREATER  = 0b00100 # 1 << 2
+    FUZZY    = 0b01000 # 1 << 3
+    CONFLICT = 0b10000 # 1 << 4
 
 # C type aliases
 Cu8 = ctypes.c_uint8
@@ -489,19 +489,6 @@ class AdbReader:
         int(AdbPkgInfoType.HASHES),
         int(AdbPkgInfoType.REPO_COMMIT),
     }
-    DEP_OP_MAP = {
-        int(ApkVersionFlag.LESS): "<",
-        int(ApkVersionFlag.LESS) | int(ApkVersionFlag.EQUAL): "<=",
-        int(ApkVersionFlag.LESS) | int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): "<~",
-        int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): "~",
-        int(ApkVersionFlag.FUZZY): "~",
-        int(ApkVersionFlag.EQUAL): "=",
-        int(ApkVersionFlag.GREATER) | int(ApkVersionFlag.EQUAL): ">=",
-        int(ApkVersionFlag.GREATER) | int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.FUZZY): ">~",
-        int(ApkVersionFlag.GREATER): ">",
-        int(ApkVersionFlag.LESS) | int(ApkVersionFlag.GREATER): "><",
-        int(ApkVersionFlag.EQUAL) | int(ApkVersionFlag.LESS) | int(ApkVersionFlag.GREATER): "",
-    }
 
     def __init__(self, adb_payload: bytes):
         self.adb = adb_payload
@@ -592,10 +579,6 @@ class AdbReader:
         except UnicodeDecodeError:
             return blob.hex()
 
-    def _dep_op_string(self, op: int) -> str:
-        base = op & ~int(ApkVersionFlag.CONFLICT)
-        return self.DEP_OP_MAP.get(base, "?")
-
     def _parse_dep(self, dep_tag: int) -> Optional[str]:
         dep = self.read_obj(dep_tag)
         name = self.blob_to_text(self.read_blob(self.obj_get(dep, AdbDepField.NAME)))
@@ -603,12 +586,32 @@ class AdbReader:
         op = self.read_int(self.obj_get(dep, AdbDepField.MATCH))
         if name is None:
             return None
-        if op is None:
-            op = int(ApkVersionFlag.EQUAL)
-        conflict = "!" if (op & int(ApkVersionFlag.CONFLICT)) else ""
-        if ver is None:
-            return f"{conflict}{name}"
-        return f"{conflict}{name}{self._dep_op_string(op)}{ver}"
+        if ver:
+            if op:
+                match op & ~ApkVersionFlag.CONFLICT:
+                    case int(ApkVersionFlag.LESS):
+                        sign = "<"
+                    case int(ApkVersionFlag.LESS | ApkVersionFlag.EQUAL):
+                        sign = "<="
+                    case int(ApkVersionFlag.LESS | ApkVersionFlag.EQUAL | ApkVersionFlag.FUZZY):
+                        sign = "<~"
+                    case int(ApkVersionFlag.FUZZY):
+                        sign = "~"
+                    case int(ApkVersionFlag.EQUAL):
+                        sign = "="
+                    case int(ApkVersionFlag.GREATER | ApkVersionFlag.EQUAL):
+                        sign = ">="
+                    case int(ApkVersionFlag.GREATER | ApkVersionFlag.EQUAL | ApkVersionFlag.FUZZY):
+                        sign = ">~"
+                    case int(ApkVersionFlag.GREATER):
+                        sign = ">"
+                    case _:
+                        panic(f"Invalid dep op {op}")
+                return f"{'!' if op & ApkVersionFlag.CONFLICT else ''}{name}{sign}{ver}"
+            else:
+                return f"{name}={ver}"
+        else:
+            return ("!" if op and op & ApkVersionFlag.CONFLICT else "") + name
 
     def _parse_dep_array(self, arr_tag: int) -> list[str]:
         out = []
