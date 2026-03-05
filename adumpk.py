@@ -31,65 +31,65 @@ def panic(msg: str, etype: Type[Exception] = ValueError) -> NoReturn:
 
 # Int Enums instead of global variables
 class AdbCompressionWay(IntEnum):
-    NONE = 0x2e # .
-    DEFLATE = 0x64 # d
-    CUSTOM = 0x63 # c
+    NONE    = 0x2e  # .
+    DEFLATE = 0x64  # d
+    CUSTOM  = 0x63  # c
 
 class AdbCompressionAlg(IntEnum):
-    NONE = 0
+    NONE    = 0
     DEFLATE = 1
-    ZSTD = 2
+    ZSTD    = 2
 
 class AdbSchema(IntEnum):
     PACKAGE = 0x676B6370
-    INDEX = 0x78646E69
+    INDEX   = 0x78646E69
 
 class AdbBlockType(IntEnum):
-    ADB = 0
-    SIG = 1
+    ADB  = 0
+    SIG  = 1
     DATA = 2
-    EXT = 3
+    EXT  = 3
 
 class AdbValType(IntEnum):
     SPECIAL = 0x00000000
-    INT = 0x10000000
-    INT32 = 0x20000000
-    INT64 = 0x30000000
-    BLOB8 = 0x80000000
-    BLOB16 = 0x90000000
-    BLOB32 = 0xA0000000
-    ARRAY = 0xD0000000
-    OBJECT = 0xE0000000
+    INT     = 0x10000000
+    INT32   = 0x20000000
+    INT64   = 0x30000000
+    BLOB8   = 0x80000000
+    BLOB16  = 0x90000000
+    BLOB32  = 0xA0000000
+    ARRAY   = 0xD0000000
+    OBJECT  = 0xE0000000
 
 class AdbField(IntEnum):
     pass
 
 class AdbPkgField(AdbField):
     PKGINFO = 1
-    PATHS = 2
+    PATHS   = 2
 
 class AdbPkgInfoType(IntEnum):
-    NAME = 1
-    VERSION = 2
-    HASHES = 3
-    DESCRIPTION =4
-    ARCH = 5
-    LICENSE= 6
-    ORIGIN = 7
-    MAINTAINER = 8
-    URL = 9
-    REPO_COMMIT = 10
-    BUILD_TIME = 11
-    INSTALLED_SIZE = 12
-    FILE_SIZE = 13
+    NAME              = 1
+    VERSION           = 2
+    HASHES            = 3
+    DESCRIPTION       = 4
+    ARCH              = 5
+    LICENSE           = 6
+    ORIGIN            = 7
+    MAINTAINER        = 8
+    URL               = 9
+    REPO_COMMIT       = 10
+    BUILD_TIME        = 11
+    INSTALLED_SIZE    = 12
+    FILE_SIZE         = 13
     PROVIDER_PRIORITY = 14
-    DEPENDS = 15
-    PROVIDES = 16
-    REPLACES = 17
-    INSTALL_IF = 18
-    RECOMMENDS = 19
-    LAYER = 20
-    TAGS = 21
+    DEPENDS           = 15
+    PROVIDES          = 16
+    REPLACES          = 17
+    INSTALL_IF        = 18
+    RECOMMENDS        = 19
+    LAYER             = 20
+    TAGS              = 21
 
     def __str__(self) -> str:
         if self < self.NAME or self > self.TAGS:
@@ -119,34 +119,34 @@ class AdbPkgInfoType(IntEnum):
         )[self - 1]
 
 class AdbDirField(AdbField):
-    NAME = 1
-    ACL = 2
+    NAME  = 1
+    ACL   = 2
     FILES = 3
 
 class AdbFileField(AdbField):
-    NAME = 1
-    ACL = 2
-    SIZE = 3
-    MTIME = 4
+    NAME   = 1
+    ACL    = 2
+    SIZE   = 3
+    MTIME  = 4
     HASHES = 5
     TARGET = 6
 
 class AdbDepField(AdbField):
-    NAME = 1
+    NAME    = 1
     VERSION = 2
-    MATCH = 3
+    MATCH   = 3
 
 class AdbAclField(AdbField):
-    MODE = 1
-    USER = 2
-    GROUP = 3
+    MODE   = 1
+    USER   = 2
+    GROUP  = 3
     XATTRS = 4
 
 class ApkVersionFlag(IntEnum):
-    EQUAL = 1
-    LESS = 2
-    GREATER = 4
-    FUZZY = 8
+    EQUAL    = 1
+    LESS     = 2
+    GREATER  = 4
+    FUZZY    = 8
     CONFLICT = 16
 
 # C type aliases
