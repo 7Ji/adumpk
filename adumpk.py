@@ -1117,42 +1117,33 @@ class ApkDumper:
             f"  [{self._blk_index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
         )
 
-    def _handle_data_block(
-        self,
-        schema: int,
-        payload_size: int,
-    ):
-        if schema == AdbSchema.PACKAGE:
-            if payload_size < SZ_CADB_DATA_PACKAGE:
-                panic("Package DATA block payload too small", FormatError)
-            data_hdr = self.stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
-            hdr = CAdbDataPackage.from_buffer_copy(data_hdr)
-            data_len = payload_size - SZ_CADB_DATA_PACKAGE
-            file_info = self._file_lookup.get((hdr.path_idx, hdr.file_idx))
-            logger.info(
-                f"  [{self._blk_index}] DATA path_idx={hdr.path_idx} file_idx={hdr.file_idx} data_len={data_len}"
+    def _handle_data_block(self, payload_size: int):
+        if payload_size < SZ_CADB_DATA_PACKAGE:
+            panic("Package DATA block payload too small", FormatError)
+        data_hdr = self.stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
+        hdr = CAdbDataPackage.from_buffer_copy(data_hdr)
+        data_len = payload_size - SZ_CADB_DATA_PACKAGE
+        file_info = self._file_lookup.get((hdr.path_idx, hdr.file_idx))
+        logger.info(
+            f"  [{self._blk_index}] DATA path_idx={hdr.path_idx} file_idx={hdr.file_idx} data_len={data_len}"
+        )
+        if file_info is None:
+            panic(f"Unexpected DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
+        logger.info(f"      path={file_info.path}")
+
+        key = (hdr.path_idx, hdr.file_idx)
+        if key in self._written_data:
+            panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
+        self._written_data.add(key)
+
+        if file_info.kind != FileKind.FILE:
+            panic(f"DATA block points to non-regular file '{file_info.path}'", FormatError)
+        if data_len != file_info.size:
+            panic(
+                f"DATA size mismatch for '{file_info.path}': {data_len} != {file_info.size}",
+                FormatError,
             )
-            if file_info is None:
-                panic(f"Unexpected DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
-            logger.info(f"      path={file_info.path}")
-
-            key = (hdr.path_idx, hdr.file_idx)
-            if key in self._written_data:
-                panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
-            self._written_data.add(key)
-
-            if file_info.kind != FileKind.FILE:
-                panic(f"DATA block points to non-regular file '{file_info.path}'", FormatError)
-            if data_len != file_info.size:
-                panic(
-                    f"DATA size mismatch for '{file_info.path}': {data_len} != {file_info.size}",
-                    FormatError,
-                )
-            self.tar_writer.add_data_file_stream(file_info, data_len, self.stream)
-            return
-
-        logger.info(f"  [{self._blk_index}] DATA payload={payload_size}")
-        self.stream.skip(payload_size, "DATA payload")
+        self.tar_writer.add_data_file_stream(file_info, data_len, self.stream)
 
     def _handle_package(self):
         self._file_lookup = {}
@@ -1167,7 +1158,7 @@ class ApkDumper:
             blk = self._read_next_block_desc(blk.raw_size)
 
         while blk is not None and blk.block_type == AdbBlockType.DATA:
-            self._handle_data_block(AdbSchema.PACKAGE, blk.payload_size)
+            self._handle_data_block(blk.payload_size)
             blk = self._read_next_block_desc(blk.raw_size)
 
         if blk is not None:
