@@ -68,7 +68,7 @@ class AdbPkgField(AdbField):
     PKGINFO = 1
     PATHS   = 2
 
-class AdbPkgInfoType(IntEnum):
+class AdbPkgInfoField(AdbField):
     NAME              = 1
     VERSION           = 2
     HASHES            = 3
@@ -479,15 +479,15 @@ class ApkBodySource:
 
 class AdbReader:
     PKGINFO_DEP_FIELDS = {
-        int(AdbPkgInfoType.DEPENDS),
-        int(AdbPkgInfoType.PROVIDES),
-        int(AdbPkgInfoType.REPLACES),
-        int(AdbPkgInfoType.INSTALL_IF),
-        int(AdbPkgInfoType.RECOMMENDS),
+        int(AdbPkgInfoField.DEPENDS),
+        int(AdbPkgInfoField.PROVIDES),
+        int(AdbPkgInfoField.REPLACES),
+        int(AdbPkgInfoField.INSTALL_IF),
+        int(AdbPkgInfoField.RECOMMENDS),
     }
     PKGINFO_HEX_FIELDS = {
-        int(AdbPkgInfoType.HASHES),
-        int(AdbPkgInfoType.REPO_COMMIT),
+        int(AdbPkgInfoField.HASHES),
+        int(AdbPkgInfoField.REPO_COMMIT),
     }
 
     def __init__(self, adb_payload: bytes):
@@ -644,11 +644,11 @@ class AdbReader:
             tag = obj[idx]
             if tag == 0:
                 continue
-            name = str(AdbPkgInfoType(idx))
+            name = str(AdbPkgInfoField(idx))
             if idx in self.PKGINFO_DEP_FIELDS:
                 meta[name] = self._parse_dep_array(tag)
                 continue
-            if idx == int(AdbPkgInfoType.TAGS):
+            if idx == int(AdbPkgInfoField.TAGS):
                 meta[name] = self._parse_string_array(tag)
                 continue
             ival = self.read_int(tag)
@@ -725,29 +725,28 @@ class AdbReader:
         ftype = stat.S_IFMT(tmode)
         match ftype:
             case stat.S_IFLNK:
-                try:
-                    return FileKind.SYMLINK, payload.decode("utf-8"), None
-                except UnicodeDecodeError:
-                    return FileKind.SYMLINK, payload.decode("utf-8", errors="surrogateescape"), None
+                fkind = FileKind.SYMLINK
+                dev = False
             case stat.S_IFREG:
-                try:
-                    return FileKind.HARDLINK, payload.decode("utf-8"), None
-                except UnicodeDecodeError:
-                    return FileKind.HARDLINK, payload.decode("utf-8", errors="surrogateescape"), None
+                fkind = FileKind.HARDLINK
+                dev = False
             case stat.S_IFBLK:
-                if len(payload) != 8:
-                    panic("Invalid device/fifo target blob length", FormatError)
-                return FileKind.BLOCK, None, int.from_bytes(payload, "little")
+                fkind = FileKind.BLOCK
+                dev = True
             case stat.S_IFCHR:
-                if len(payload) != 8:
-                    panic("Invalid device/fifo target blob length", FormatError)
-                return FileKind.CHAR, None, int.from_bytes(payload, "little")
+                fkind = FileKind.CHAR
+                dev = True
             case stat.S_IFIFO:
-                if len(payload) != 8:
-                    panic("Invalid device/fifo target blob length", FormatError)
-                return FileKind.FIFO, None, int.from_bytes(payload, "little")
+                fkind = FileKind.FIFO
+                dev = True
             case _:
-                return FileKind.UNKNOWN, None, None
+                panic(f"Unsupported ftype {ftype} in TARGET", FormatError)
+        if dev:
+            if len(payload) != 8:
+                panic("Invalid device/fifo target blob length", FormatError)
+            return fkind, None, int.from_bytes(payload, "little")
+        else:
+            return fkind, payload.decode("utf-8"), None
 
     def parse_package(self) -> tuple[PackageMetadata, list[DirectoryEntry], list[FileEntry], dict[tuple[int, int], FileEntry]]:
         if len(self.adb) < SZ_CADB_HDR:
