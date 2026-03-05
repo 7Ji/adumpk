@@ -291,8 +291,8 @@ class RawApkByteStream(ApkByteStream):
         return self._f.read(size)
 
 class RingByteBuffer:
-    def __init__(self, capacity: int = 1024 * 1024):
-        self._buf = bytearray(capacity)
+    def __init__(self, capacity: int = 1024 * 1024): # Default size 1 MiB
+        self._buffer = bytearray(capacity)
         self._head = 0
         self._size = 0
 
@@ -300,49 +300,48 @@ class RingByteBuffer:
         return self._size
 
     def _ensure_capacity(self, required: int):
-        if required <= len(self._buf):
+        new_capacity = len(self._buffer)
+        if new_capacity >= required:
             return
-        new_cap = len(self._buf)
-        while new_cap < required:
-            new_cap *= 2
-        new_buf = bytearray(new_cap)
+        while new_capacity < required:
+            new_capacity *= 2
+        new_buffer = bytearray(new_capacity)
         if self._size > 0:
-            first = min(self._size, len(self._buf) - self._head)
-            new_buf[0:first] = self._buf[self._head:self._head + first]
-            second = self._size - first
-            if second > 0:
-                new_buf[first:first + second] = self._buf[0:second]
-        self._buf = new_buf
+            size_first = min(self._size, new_capacity - self._head)
+            new_buffer[0:size_first] = self._buffer[self._head:self._head+size_first]
+            size_second = self._size - size_first
+            if size_second > 0:
+                new_buffer[size_first:size_first+size_second] = self._buffer[0:size_second]
+        self._buffer = new_buffer
         self._head = 0
 
     def write(self, data: bytes):
         if not data:
             return
-        data_len = len(data)
-        self._ensure_capacity(self._size + data_len)
-        tail = (self._head + self._size) % len(self._buf)
-        first = min(data_len, len(self._buf) - tail)
-        self._buf[tail:tail + first] = data[0:first]
-        second = data_len - first
-        if second > 0:
-            self._buf[0:second] = data[first:first + second]
-        self._size += data_len
+        len_data = len(data)
+        new_size = self._size + len_data
+        self._ensure_capacity(new_size)
+        len_buffer = len(self._buffer)
+        tail = (self._head + self._size) % len_buffer
+        size_first = min(len_data, len_buffer - tail)
+        self._buffer[tail:tail+size_first] = data[0:size_first]
+        size_second = len_data - size_first
+        if size_second > 0:
+            self._buffer[0:size_second] = data[size_first:size_first+size_second]
+        self._size = new_size
 
     def read(self, size: int) -> bytes:
         if size <= 0 or self._size == 0:
             return b""
-        out_len = min(size, self._size)
-        first = min(out_len, len(self._buf) - self._head)
-        if first == out_len:
-            out = bytes(self._buf[self._head:self._head + out_len])
-        else:
-            out = (
-                bytes(self._buf[self._head:self._head + first]) +
-                bytes(self._buf[0:out_len - first])
-            )
-        self._head = (self._head + out_len) % len(self._buf)
-        self._size -= out_len
-        return out
+        len_out = min(size, self._size)
+        len_buffer = len(self._buffer)
+        size_first = min(len_out, len_buffer - self._head)
+        out = self._buffer[self._head:self._head+size_first]
+        if size_first < len_out:
+            out += self._buffer[0:len_out-size_first]
+        self._head = (self._head + len_out) % len_buffer
+        self._size -= len_out
+        return bytes(out)
 
 class DeflateApkByteStream(ApkByteStream):
     def __init__(self, f: BinaryIO):
@@ -1205,7 +1204,6 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
             }
             json.dump(meta_doc, f_json, indent=2, sort_keys=True)
             f_json.write("\n")
-
 
 if __name__ == "__main__":
     logging._levelToName = {
