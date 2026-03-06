@@ -29,7 +29,6 @@ def panic(msg: str, etype: Type[Exception] = ValueError) -> NoReturn:
     logger.fatal(msg)
     raise etype(msg)
 
-# Int Enums instead of global variables
 class AdbCompressionWay(IntEnum):
     NONE    = 0x2e  # .
     DEFLATE = 0x64  # d
@@ -283,8 +282,10 @@ class AdbStream(ABC):
                 panic(f"Truncated {what}", FormatError)
             remaining -= len(chunk)
 
-    def close(self):
-        pass
+    def lossy_assert_raw(self):
+        header = self.read_exact(4, "raw header")
+        if header != b"ADB.":
+            panic(f"Inner raw stream is not b'ADB.' (BE 0x6164622E), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}{header[3]:x}", FormatError)
 
 class RawAdbStream(AdbStream):
     __slots__ = ("_file")
@@ -353,7 +354,6 @@ class _RingBuffer:
         self._size -= len_out
         return out
 
-
 class DeflateAdbStream(AdbStream):
     __slots__ = ("_file", "_decompressor", "_buffer", "_eof")
 
@@ -382,7 +382,7 @@ class DeflateAdbStream(AdbStream):
         self._fill(size)
         return self._buffer.read(size)
 
-class ZstdAdbStream(AdbStream):
+class ZstandardAdbStream(AdbStream):
     __slots__ = ("_file", "_decompressor", "_buffer", "_eof")
 
     def __init__(self, file: BinaryIO):
@@ -417,82 +417,6 @@ class ZstdAdbStream(AdbStream):
             return bytearray()
         self._fill(size)
         return self._buffer.read(size)
-
-class ApkBodySource:
-    def __init__(self, f: BinaryIO, stream: AdbStream):
-        self._f = f
-        self.stream = stream
-        self._closed = False
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        self.stream.close()
-        self._f.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-
-    @staticmethod
-    def assert_head(head: bytes, what: str):
-        if head[0:3] != b"ADB":
-            panic(f"{what} is not an APK", FormatError)
-
-    @staticmethod
-    def assert_header(stream: AdbStream, what: str):
-        head = stream.read_exact(4, f"{what} header")
-        ApkBodySource.assert_head(bytes(head), what)
-
-    @classmethod
-    def open(cls, path_apk: Path) -> "ApkBodySource":
-        f = path_apk.open("rb")
-        try:
-            head = f.read(6)
-            if len(head) < 4:
-                panic("File too small, meanless to dump")
-            cls.assert_head(head, "File")
-
-            match head[3]:
-                case AdbCompressionWay.NONE:
-                    f.seek(4)
-                    return cls(f, RawAdbStream(f))
-                case AdbCompressionWay.DEFLATE:
-                    f.seek(4)
-                    stream = DeflateAdbStream(f)
-                    cls.assert_header(stream, "Inner deflate stream")
-                    return cls(f, stream)
-                case AdbCompressionWay.CUSTOM:
-                    if len(head) < 6:
-                        panic("Truncated custom compression spec", FormatError)
-                    spec = CAdbCompressionSpec.from_buffer_copy(head, 4)
-                    match spec.alg:
-                        case AdbCompressionAlg.NONE:
-                            f.seek(6)
-                            return cls(f, RawAdbStream(f))
-                        case AdbCompressionAlg.DEFLATE:
-                            f.seek(6)
-                            stream = DeflateAdbStream(f)
-                            cls.assert_header(stream, "Inner deflate stream")
-                            return cls(f, stream)
-                        case AdbCompressionAlg.ZSTD:
-                            if zstd is None:
-                                panic("Zstd compression not supported on current Python installation")
-                            f.seek(6)
-                            stream = ZstdAdbStream(f)
-                            cls.assert_header(stream, "Inner zstd stream")
-                            return cls(f, stream)
-                        case _:
-                            panic(f"Invalid compression alg ID {spec.alg} (level {spec.level}) ", FormatError)
-                case _:
-                    panic(f"Invalid compression magic {head[3]:x}", FormatError)
-        except Exception:
-            f.close()
-            raise
-        panic("Unreachable compression state", RuntimeError)
 
 class AdbReader:
     __slots__ = ("adb",)
@@ -1204,8 +1128,38 @@ class ApkDumper:
                 panic(f"Unknown schema {schema:#x}", FormatError)
 
 def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
-    with ApkBodySource.open(path_apk) as src:
-        stream = src.stream
+    with path_apk.open("rb") as f:
+        header = f.read(4)
+        if len(header) < 4:
+            panic("File too small, meanless to dump")
+        if header[0:3] != b"ADB":
+            panic(f"File header (first 3 bytes) is not b'ADB' (BE 0x616462), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}", FormatError)
+        match header[3]:
+            case AdbCompressionWay.NONE:
+                stream = RawAdbStream(f)
+            case AdbCompressionWay.DEFLATE:
+                stream = DeflateAdbStream(f)
+                stream.lossy_assert_raw()
+            case AdbCompressionWay.CUSTOM:
+                header = f.read(2)
+                if len(header) < 2:
+                    panic("Truncated custom compression spec", FormatError)
+                spec = CAdbCompressionSpec.from_buffer_copy(header)
+                match spec.alg:
+                    case AdbCompressionAlg.NONE:
+                        stream = RawAdbStream(f)
+                    case AdbCompressionAlg.DEFLATE:
+                        stream = DeflateAdbStream(f)
+                        stream.lossy_assert_raw()
+                    case AdbCompressionAlg.ZSTD:
+                        if zstd is None:
+                            panic("Zstd compression not supported on current Python installation")
+                        stream = ZstandardAdbStream(f)
+                        stream.lossy_assert_raw()
+                    case _:
+                        panic(f"Invalid compression alg ID {spec.alg} (level {spec.level}) ", FormatError)
+            case _:
+                panic(f"Invalid compression magic {header[3]:x}", FormatError)
 
         mode_tar = "w:"
         if path_tar:
