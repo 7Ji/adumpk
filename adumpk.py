@@ -242,40 +242,43 @@ class PackageSchemaMeta:
     dirs: list[DirectoryEntry]
     files: list[FileEntry]
 
-class ApkByteStream(ABC):
+SZ_CHUNK = 1024 * 1024 # 1 MiB
+
+class AdbStream(ABC):
     @abstractmethod
-    def read(self, size: int) -> bytes:
+    def read(self, size: int) -> bytearray:
         raise NotImplementedError
 
-    def read_exact(self, size: int, what: str) -> bytes:
-        if size <= 0:
-            return b""
-        out = bytearray()
-        while len(out) < size:
-            chunk = self.read(size - len(out))
+    def _read_exact_inner(self, size: int, what: str, out: bytearray) -> bytearray:
+        len_out = len(out)
+        while True:
+            chunk = self.read(size - len_out)
             if not chunk:
                 panic(f"Truncated {what}", FormatError)
             out.extend(chunk)
-        return bytes(out)
+            len_out = len(out)
+            if len_out == size:
+                return out
+            elif len_out > size:
+                panic(f"More {what} read than expected, {len_out} > {size}", IOError)
 
-    def read_exact_or_none(self, size: int, what: str) -> Optional[bytes]:
+    def read_exact(self, size: int, what: str) -> bytearray:
+        if size <= 0:
+            return bytearray()
+        return self._read_exact_inner(size, what, bytearray())
+
+    def read_exact_or_none(self, size: int, what: str) -> Optional[bytearray]:
         first = self.read(size)
         if not first:
             return None
         if len(first) == size:
             return first
-        out = bytearray(first)
-        while len(out) < size:
-            chunk = self.read(size - len(out))
-            if not chunk:
-                panic(f"Truncated {what}", FormatError)
-            out.extend(chunk)
-        return bytes(out)
+        return self._read_exact_inner(size, what, first)
 
     def skip(self, size: int, what: str):
         remaining = size
         while remaining > 0:
-            chunk = self.read(min(remaining, 1024 * 1024))
+            chunk = self.read(min(remaining, SZ_CHUNK))
             if not chunk:
                 panic(f"Truncated {what}", FormatError)
             remaining -= len(chunk)
@@ -283,15 +286,22 @@ class ApkByteStream(ABC):
     def close(self):
         pass
 
-class RawApkByteStream(ApkByteStream):
-    def __init__(self, f: BinaryIO):
-        self._f = f
+class RawAdbStream(AdbStream):
+    __slots__ = ("_file")
 
-    def read(self, size: int) -> bytes:
-        return self._f.read(size)
+    def __init__(self, file: io.BufferedReader):
+        self._file = file
 
-class RingByteBuffer:
-    def __init__(self, capacity: int = 1024 * 1024): # Default size 1 MiB
+    def read(self, size: int) -> bytearray:
+        buffer = bytearray(size)
+        len_read = self._file.readinto(buffer)
+        del(buffer[len_read:])
+        return buffer
+
+class _RingBuffer:
+    __slots__ = ("_buffer", "_head", "_size")
+
+    def __init__(self, capacity: int = SZ_CHUNK): # Default size 1 MiB
         self._buffer = bytearray(capacity)
         self._head = 0
         self._size = 0
@@ -315,7 +325,7 @@ class RingByteBuffer:
         self._buffer = new_buffer
         self._head = 0
 
-    def write(self, data: bytes):
+    def write(self, data: bytes | bytearray):
         if not data:
             return
         len_data = len(data)
@@ -330,9 +340,9 @@ class RingByteBuffer:
             self._buffer[0:size_second] = data[size_first:size_first+size_second]
         self._size = new_size
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int) -> bytearray:
         if size <= 0 or self._size == 0:
-            return b""
+            return bytearray()
         len_out = min(size, self._size)
         len_buffer = len(self._buffer)
         size_first = min(len_out, len_buffer - self._head)
@@ -341,67 +351,75 @@ class RingByteBuffer:
             out += self._buffer[0:len_out-size_first]
         self._head = (self._head + len_out) % len_buffer
         self._size -= len_out
-        return bytes(out)
+        return out
 
-class DeflateApkByteStream(ApkByteStream):
-    def __init__(self, f: BinaryIO):
-        self._f = f
-        self._dec = zlib.decompressobj(wbits=-15)
-        self._out = RingByteBuffer()
+
+class DeflateAdbStream(AdbStream):
+    __slots__ = ("_file", "_decompressor", "_buffer", "_eof")
+
+    def __init__(self, file: BinaryIO):
+        self._file = file
+        self._decompressor = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+        self._buffer = _RingBuffer()
         self._eof = False
 
     def _fill(self, size: int):
-        while len(self._out) < size and not self._eof:
-            in_chunk = self._f.read(1024 * 1024)
+        while self._buffer._size < size and not self._eof:
+            in_chunk = self._file.read(SZ_CHUNK)
             if not in_chunk:
-                self._out.write(self._dec.flush())
+                self._buffer.write(
+                    self._decompressor.flush()
+                )
                 self._eof = True
                 break
-            self._out.write(self._dec.decompress(in_chunk))
+            self._buffer.write(
+                self._decompressor.decompress(in_chunk)
+            )
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int) -> bytearray:
         if size <= 0:
-            return b""
+            return bytearray()
         self._fill(size)
-        return self._out.read(size)
+        return self._buffer.read(size)
 
-class ZstdApkByteStream(ApkByteStream):
-    def __init__(self, f: BinaryIO):
-        self._f = f
+class ZstdAdbStream(AdbStream):
+    __slots__ = ("_file", "_decompressor", "_buffer", "_eof")
+
+    def __init__(self, file: BinaryIO):
         if zstd is None:
             panic("Zstd module was not imported")
-        else:
-            self._dec = zstd.ZstdDecompressor()
-        self._out = RingByteBuffer()
-        self._done = False
+        self._file = file
+        self._decompressor = zstd.ZstdDecompressor()
+        self._buffer = _RingBuffer()
+        self._eof = False
 
     def _fill(self, size: int):
-        while len(self._out) < size and not self._done:
-            if self._dec.needs_input:
-                in_chunk = self._f.read(1024 * 1024)
+        while self._buffer._size < size and not self._eof:
+            if self._decompressor.needs_input:
+                in_chunk = self._file.read(SZ_CHUNK)
                 if not in_chunk:
                     panic("Truncated zstd stream", FormatError)
             else:
                 in_chunk = b""
 
-            out_chunk = self._dec.decompress(in_chunk, max_length=1024 * 1024)
+            out_chunk = self._decompressor.decompress(in_chunk)
             if out_chunk:
-                self._out.write(out_chunk)
-            elif self._dec.needs_input and not in_chunk:
+                self._buffer.write(out_chunk)
+            elif self._decompressor.needs_input and not in_chunk:
                 panic("Truncated zstd stream", FormatError)
 
-            if self._dec.eof:
-                self._done = True
+            if self._decompressor.eof:
+                self._eof = True
                 break
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int) -> bytearray:
         if size <= 0:
-            return b""
+            return bytearray()
         self._fill(size)
-        return self._out.read(size)
+        return self._buffer.read(size)
 
 class ApkBodySource:
-    def __init__(self, f: BinaryIO, stream: ApkByteStream):
+    def __init__(self, f: BinaryIO, stream: AdbStream):
         self._f = f
         self.stream = stream
         self._closed = False
@@ -425,9 +443,9 @@ class ApkBodySource:
             panic(f"{what} is not an APK", FormatError)
 
     @staticmethod
-    def assert_header(stream: ApkByteStream, what: str):
+    def assert_header(stream: AdbStream, what: str):
         head = stream.read_exact(4, f"{what} header")
-        ApkBodySource.assert_head(head, what)
+        ApkBodySource.assert_head(bytes(head), what)
 
     @classmethod
     def open(cls, path_apk: Path) -> "ApkBodySource":
@@ -441,10 +459,10 @@ class ApkBodySource:
             match head[3]:
                 case AdbCompressionWay.NONE:
                     f.seek(4)
-                    return cls(f, RawApkByteStream(f))
+                    return cls(f, RawAdbStream(f))
                 case AdbCompressionWay.DEFLATE:
                     f.seek(4)
-                    stream = DeflateApkByteStream(f)
+                    stream = DeflateAdbStream(f)
                     cls.assert_header(stream, "Inner deflate stream")
                     return cls(f, stream)
                 case AdbCompressionWay.CUSTOM:
@@ -454,17 +472,17 @@ class ApkBodySource:
                     match spec.alg:
                         case AdbCompressionAlg.NONE:
                             f.seek(6)
-                            return cls(f, RawApkByteStream(f))
+                            return cls(f, RawAdbStream(f))
                         case AdbCompressionAlg.DEFLATE:
                             f.seek(6)
-                            stream = DeflateApkByteStream(f)
+                            stream = DeflateAdbStream(f)
                             cls.assert_header(stream, "Inner deflate stream")
                             return cls(f, stream)
                         case AdbCompressionAlg.ZSTD:
                             if zstd is None:
                                 panic("Zstd compression not supported on current Python installation")
                             f.seek(6)
-                            stream = ZstdApkByteStream(f)
+                            stream = ZstdAdbStream(f)
                             cls.assert_header(stream, "Inner zstd stream")
                             return cls(f, stream)
                         case _:
@@ -477,6 +495,8 @@ class ApkBodySource:
         panic("Unreachable compression state", RuntimeError)
 
 class AdbReader:
+    __slots__ = ("adb",)
+
     PKGINFO_DEP_FIELDS = {
         int(AdbPkgInfoField.DEPENDS),
         int(AdbPkgInfoField.PROVIDES),
@@ -489,7 +509,7 @@ class AdbReader:
         int(AdbPkgInfoField.REPO_COMMIT),
     }
 
-    def __init__(self, adb_payload: bytes):
+    def __init__(self, adb_payload: bytearray):
         self.adb = adb_payload
 
     # The highest 4 bits in a value mark is type, as defined in AdbValType
@@ -503,17 +523,17 @@ class AdbReader:
     def _u16(self, off: int) -> int:
         if off + SZ_CU16 > len(self.adb):
             panic(f"Truncated u16 at offset {off}", FormatError)
-        return Cu16.from_buffer_copy(self.adb, off).value
+        return Cu16.from_buffer(self.adb, off).value
 
     def _u32(self, off: int) -> int:
         if off + SZ_CU32 > len(self.adb):
             panic(f"Truncated u32 at offset {off}", FormatError)
-        return Cu32.from_buffer_copy(self.adb, off).value
+        return Cu32.from_buffer(self.adb, off).value
 
     def _u64(self, off: int) -> int:
         if off + SZ_CU64 > len(self.adb):
             panic(f"Truncated u64 at offset {off}", FormatError)
-        return Cu64.from_buffer_copy(self.adb, off).value
+        return Cu64.from_buffer(self.adb, off).value
 
     def read_int(self, v: int) -> Optional[int]:
         t = self._val_type(v)
@@ -561,7 +581,7 @@ class AdbReader:
         end = off + num * SZ_CU32
         if end > len(self.adb):
             panic(f"Object/array at offset {off} exceeds ADB payload", FormatError)
-        return [Cu32.from_buffer_copy(self.adb, off + i * SZ_CU32).value for i in range(num)]
+        return [Cu32.from_buffer(self.adb, off + i * SZ_CU32).value for i in range(num)]
 
     @staticmethod
     def obj_get(obj: list[int], index: AdbField) -> int:
@@ -750,7 +770,7 @@ class AdbReader:
     def parse_package(self) -> tuple[PackageMetadata, list[DirectoryEntry], list[FileEntry], dict[tuple[int, int], FileEntry]]:
         if len(self.adb) < SZ_CADB_HDR:
             panic("ADB payload too small for header", FormatError)
-        hdr = CAdbHdr.from_buffer_copy(self.adb)
+        hdr = CAdbHdr.from_buffer(self.adb)
         pkg = self.read_obj(hdr.root)
 
         metadata: PackageMetadata = {}
@@ -822,7 +842,7 @@ class AdbReader:
         return metadata, dirs, file_entries, file_lookup
 
 class _TarDataStream:
-    def __init__(self, stream: ApkByteStream, size: int):
+    def __init__(self, stream: AdbStream, size: int):
         self._stream = stream
         self._remaining = size
 
@@ -833,7 +853,7 @@ class _TarDataStream:
             size = self._remaining
         data = self._stream.read_exact(size, "DATA payload")
         self._remaining -= len(data)
-        return data
+        return bytes(data)
 
 class TarEmitter:
     NOBODY_ID = 65534
@@ -1003,7 +1023,7 @@ class TarEmitter:
             case _:
                 panic(f"Invalid file type to add: {kind}", FormatError)
 
-    def add_data_file_stream(self, f: FileEntry, data_len: int, stream: ApkByteStream):
+    def add_data_file_stream(self, f: FileEntry, data_len: int, stream: AdbStream):
         self._add_parent_dirs(f.path)
         ti = self._tarinfo_file(
             f,
@@ -1023,7 +1043,7 @@ class BlockDesc:
     payload_size: int
 
 class ApkDumper:
-    def __init__(self, stream: ApkByteStream, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]):
+    def __init__(self, stream: AdbStream, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]):
         self.stream = stream
         self.tar_writer = TarEmitter(tar)
         self.meta_schemas = meta_schemas
@@ -1036,11 +1056,11 @@ class ApkDumper:
         if type_size_raw is None:
             return None
 
-        type_size = Cu32.from_buffer_copy(type_size_raw).value
+        type_size = Cu32.from_buffer(type_size_raw).value
         block_type = type_size >> 30
         if block_type == AdbBlockType.EXT:
             ext = self.stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
-            blk = CAdbBlock.from_buffer_copy(type_size_raw + ext)
+            blk = CAdbBlock.from_buffer(type_size_raw + ext)
             block_type = type_size & 0x3fffffff
             raw_size = blk.x_size
             hdr_size = SZ_CADB_BLOCK
@@ -1078,7 +1098,7 @@ class ApkDumper:
         if payload_size < SZ_CADB_HDR:
             panic("ADB block payload too small", FormatError)
         adb_payload = self.stream.read_exact(payload_size, "ADB block payload")
-        adb_hdr = CAdbHdr.from_buffer_copy(adb_payload)
+        adb_hdr = CAdbHdr.from_buffer(adb_payload)
         logger.info(
             f"  [{self._blk_index}] ADB payload={payload_size} compat={adb_hdr.adb_compat_ver} ver={adb_hdr.adb_ver}"
         )
@@ -1113,7 +1133,7 @@ class ApkDumper:
         if payload_size < SZ_CADB_SIGN_HDR:
             panic("SIG block payload too small", FormatError)
         sig_payload = self.stream.read_exact(payload_size, "SIG block payload")
-        sig = CAdbSignHdr.from_buffer_copy(sig_payload)
+        sig = CAdbSignHdr.from_buffer(sig_payload)
         logger.info(
             f"  [{self._blk_index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
         )
@@ -1122,7 +1142,7 @@ class ApkDumper:
         if payload_size < SZ_CADB_DATA_PACKAGE:
             panic("Package DATA block payload too small", FormatError)
         data_hdr = self.stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
-        hdr = CAdbDataPackage.from_buffer_copy(data_hdr)
+        hdr = CAdbDataPackage.from_buffer(data_hdr)
         data_len = payload_size - SZ_CADB_DATA_PACKAGE
         file_info = self._file_lookup.get((hdr.path_idx, hdr.file_idx))
         logger.info(
@@ -1170,7 +1190,7 @@ class ApkDumper:
             panic(f"Unknown block type {blk.block_type}", FormatError)
 
     def run(self):
-        schema = CAdbSchema.from_buffer_copy(
+        schema = CAdbSchema.from_buffer(
             self.stream.read_exact(SZ_CADB_SCHEMA, "schema")
         ).value
 
