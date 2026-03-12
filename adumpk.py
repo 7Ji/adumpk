@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 from abc import ABC, abstractmethod
 import argparse
-import ctypes
-from ctypes import LittleEndianStructure
+import base64
+from contextlib import ExitStack
 try:
     from compression import zstd
 except ModuleNotFoundError:
     zstd = None
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 import io
 import json
@@ -17,12 +17,13 @@ from pathlib import PosixPath as Path
 import stat
 import sys
 import tarfile
-from typing import BinaryIO, NoReturn, Optional, Type
+import time
+from typing import Any, BinaryIO, NoReturn, Optional, Self, Sequence, Type, Union
 import zlib
 
 logger = logging.getLogger(__name__)
 
-class FormatError(ValueError):
+class ApkFormatError(ValueError):
     pass
 
 def panic(msg: str, etype: Type[Exception] = ValueError) -> NoReturn:
@@ -63,9 +64,35 @@ class AdbValType(IntEnum):
 class AdbField(IntEnum):
     pass
 
+class AdbAclField(AdbField):
+    MODE   = 1
+    USER   = 2
+    GROUP  = 3
+    XATTRS = 4
+
+class AdbDepField(AdbField):
+    NAME    = 1
+    VERSION = 2
+    MATCH   = 3
+
+class AdbDirField(AdbField):
+    NAME  = 1
+    ACL   = 2
+    FILES = 3
+
+class AdbFileField(AdbField):
+    NAME   = 1
+    ACL    = 2
+    SIZE   = 3
+    MTIME  = 4
+    HASHES = 5
+    TARGET = 6
+
 class AdbPkgField(AdbField):
-    PKGINFO = 1
-    PATHS   = 2
+    PKGINFO  = 1
+    PATHS    = 2
+    SCRIPTS  = 3
+    TRIGGERS = 4
 
 class AdbPkgInfoField(AdbField):
     NAME              = 1
@@ -117,129 +144,369 @@ class AdbPkgInfoField(AdbField):
             "tags",
         )[self - 1]
 
-class AdbDirField(AdbField):
-    NAME  = 1
-    ACL   = 2
-    FILES = 3
+class AdbScriptField(AdbField):
+    TRIGGER     = 1
+    PREINST     = 2
+    POSTINST    = 3
+    PREDEINST   = 4
+    POSTDEINST  = 5
+    PREUPGRADE  = 6
+    POSTUPGRADE = 7
 
-class AdbFileField(AdbField):
-    NAME   = 1
-    ACL    = 2
-    SIZE   = 3
-    MTIME  = 4
-    HASHES = 5
-    TARGET = 6
-
-class AdbDepField(AdbField):
-    NAME    = 1
-    VERSION = 2
-    MATCH   = 3
-
-class AdbAclField(AdbField):
-    MODE   = 1
-    USER   = 2
-    GROUP  = 3
-    XATTRS = 4
-
-class ApkVersionFlag(IntEnum):
+class AdbVersionFlag(IntEnum):
     EQUAL    = 0b00001 # 1 << 0
     LESS     = 0b00010 # 1 << 1
     GREATER  = 0b00100 # 1 << 2
     FUZZY    = 0b01000 # 1 << 3
     CONFLICT = 0b10000 # 1 << 4
 
-# C type aliases
-Cu8 = ctypes.c_uint8
-Cu16 = ctypes.c_uint16
-Cu32 = ctypes.c_uint32
-Cu64 = ctypes.c_uint64
-CAdbSchema = Cu32
+@dataclass
+class ApkDepend:
+    name: str = ""
+    version: str = ""
+    match: int = AdbVersionFlag.EQUAL
 
-class CAdbCompressionSpec(LittleEndianStructure):
-    _fields_ = (("alg",   Cu8),
-                ("level", Cu8))
+    def literal(self) -> str:
+        if self.version:
+            if self.match & AdbVersionFlag.CONFLICT:
+                flags = self.match & ~AdbVersionFlag.CONFLICT
+                conflict = "!"
+            else:
+                flags = self.match
+                conflict = ""
+            match flags:
+                case int(AdbVersionFlag.LESS):
+                    sign = "<"
+                case int(AdbVersionFlag.LESS | AdbVersionFlag.EQUAL):
+                    sign = "<="
+                case int(AdbVersionFlag.LESS | AdbVersionFlag.EQUAL | AdbVersionFlag.FUZZY):
+                    sign = "<~"
+                case int(AdbVersionFlag.FUZZY):
+                    sign = "~"
+                case int(AdbVersionFlag.EQUAL):
+                    sign = "="
+                case int(AdbVersionFlag.GREATER | AdbVersionFlag.EQUAL):
+                    sign = ">="
+                case int(AdbVersionFlag.GREATER | AdbVersionFlag.EQUAL | AdbVersionFlag.FUZZY):
+                    sign = ">~"
+                case int(AdbVersionFlag.GREATER):
+                    sign = ">"
+                case _:
+                    panic(f"Invalid dep flags {flags:x}")
+            return f"{conflict}{self.name}{sign}{self.version}"
+        else:
+            return self.name
 
-class CAdbBlock(LittleEndianStructure):
-    _fields_ = (("type_size", Cu32),
-                ("reserved", Cu32),
-                ("x_size", Cu64))
+class ApkHashType(IntEnum):
+    NONE        = 0
+    SHA1        = 2
+    SHA256      = 3
+    SHA512      = 4
+    SHA256_160  = 5
 
-class CAdbHdr(LittleEndianStructure):
-    _fields_ = (("adb_compat_ver", Cu8),
-                ("adb_ver", Cu8),
-                ("reserved", Cu16),
-                ("root", Cu32))
+    def __str__(self):
+        return (
+            "none",
+            "INVALID",
+            "sha1",
+            "sha256",
+            "sha512",
+            "sha256_160"
+        )[self]
 
-class CAdbSignHdr(LittleEndianStructure):
-    _fields_ = (("sign_ver", Cu8),
-                ("hash_alg", Cu8))
+@dataclass
+class ApkHash:
+    hash_type: ApkHashType = ApkHashType.NONE
+    raw: bytes = b""
+    as_hex: str = ""
 
-class CAdbDataPackage(LittleEndianStructure):
-    _fields_ = (("path_idx", Cu32),
-                ("file_idx", Cu32))
+    @classmethod
+    def from_raw(cls, raw: bytes | bytearray) -> Self:
+        len_hash = len(raw)
+        match len_hash:
+            case 20:
+                hash_type = ApkHashType.SHA1
+            case 32:
+                hash_type = ApkHashType.SHA256
+            case 64:
+                hash_type = ApkHashType.SHA512
+            case _:
+                panic(f"Unknown hash with length {len_hash}", ApkFormatError)
+        return cls(hash_type, bytes(raw), raw.hex())
 
-# Cached size constants for hot-path parsing
-SZ_CU8 = ctypes.sizeof(Cu8)
-SZ_CU16 = ctypes.sizeof(Cu16)
-SZ_CU32 = ctypes.sizeof(Cu32)
-SZ_CU64 = ctypes.sizeof(Cu64)
-SZ_CADB_SCHEMA = ctypes.sizeof(CAdbSchema)
-SZ_CADB_BLOCK = ctypes.sizeof(CAdbBlock)
-SZ_CADB_HDR = ctypes.sizeof(CAdbHdr)
-SZ_CADB_SIGN_HDR = ctypes.sizeof(CAdbSignHdr)
-SZ_CADB_DATA_PACKAGE = ctypes.sizeof(CAdbDataPackage)
+    def as_json_dict(self) -> dict[str, str]:
+        return {
+            "type": str(self.hash_type),
+            "value": self.as_hex
+        }
 
-PkgMetaValue = int | str | list[str]
-PackageMetadata = dict[str, PkgMetaValue]
+def _str_from_optional_int(value: Optional[int]):
+    if value is None:
+        return ""
+    else:
+        return str(value)
 
-class FileKind(StrEnum):
-    FILE = "file"
+@dataclass
+class ApkPkginfo:
+    name: str = ""
+    version: str = ""
+    hashes: ApkHash = field(default_factory=ApkHash)
+    description: str = ""
+    arch: str = ""
+    license: str = ""
+    origin: str = ""
+    maintainer: str = ""
+    url: str = ""
+    repo_commit: bytes = b""
+    build_time: Optional[int] = None
+    installed_size: Optional[int] = None
+    file_size: Optional[int] = None
+    provider_priority: Optional[int] = None
+    depends: list[ApkDepend] = field(default_factory=list)
+    provides: list[ApkDepend] = field(default_factory=list)
+    replaces: list[ApkDepend] = field(default_factory=list)
+    install_if: list[ApkDepend] = field(default_factory=list)
+    recommends: list[ApkDepend] = field(default_factory=list)
+    layer: Optional[int] = None
+    tags: list[str] = field(default_factory=list)
+
+    def show(self):
+        values = [
+            ("name", self.name),
+            ("version", self.version),
+            ("checksum", "-"),
+            ("description", self.description),
+            ("arch", self.arch),
+            ("license", self.license),
+            ("origin", self.origin),
+            ("maintainer", self.maintainer),
+            ("url", self.url),
+            ("repo_commit", self.repo_commit.hex()),
+            ("build_time", _str_from_optional_int(self.build_time)),
+            ("installed_size", _str_from_optional_int(self.installed_size)),
+            ("file_size", _str_from_optional_int(self.file_size)),
+            ("provider_priority", _str_from_optional_int(self.provider_priority)),
+            ("depends", [item.literal() for item in self.depends]),
+            ("provides", [item.literal() for item in self.provides]),
+            ("replaces", [item.literal() for item in self.replaces]),
+            ("install_if", [item.literal() for item in self.install_if]),
+            ("recommends", [item.literal() for item in self.recommends]),
+            ("layer", _str_from_optional_int(self.layer)),
+            ("tags", self.tags),
+        ]
+        if self.hashes is not None:
+            values[2] = (str(self.hashes.hash_type) + "sum", self.hashes.as_hex)
+        for key, value in values:
+            logger.info(f"{key:17}: {value}")
+
+    def as_json_dict(self) -> dict[str, Union[str, dict[str, str], list[str]]]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "checksum": self.hashes.as_json_dict(),
+            "description": self.description,
+            "arch": self.arch,
+            "license": self.license,
+            "origin": self.origin,
+            "maintainer": self.maintainer,
+            "url": self.url,
+            "repo_commit": self.repo_commit.hex(),
+            "build_time": _str_from_optional_int(self.build_time),
+            "installed_size": _str_from_optional_int(self.installed_size),
+            "file_size": _str_from_optional_int(self.file_size),
+            "provider_priority": _str_from_optional_int(self.provider_priority),
+            "depends": [item.literal() for item in self.depends],
+            "provides": [item.literal() for item in self.provides],
+            "replaces": [item.literal() for item in self.replaces],
+            "install_if": [item.literal() for item in self.install_if],
+            "recommends": [item.literal() for item in self.recommends],
+            "layer": _str_from_optional_int(self.layer),
+            "tags": self.tags,
+        }
+
+def _str_b64_from_bytes(value: bytes) -> str:
+    if value:
+        return base64.urlsafe_b64encode(value).decode("ascii")
+    else:
+        return ""
+
+@dataclass
+class ApkAcl:
+    mode: int = 0
+    user: str = ""
+    group: str = ""
+    xattrs: list[tuple[str, bytes]] = field(default_factory=list)
+
+    def literal(self):
+        parts = []
+        for mode in (self.mode & 0o700) >> 6, (self.mode & 0o070) >> 3, self.mode & 0o007:
+            if mode & 0o4:
+                parts.append("r")
+            else:
+                parts.append("-")
+            if mode & 0o2:
+                parts.append("w")
+            else:
+                parts.append("-")
+            if mode & 0o1:
+                parts.append("x")
+            else:
+                parts.append("-")
+        return f"{''.join(parts)} {len(self.xattrs)} {self.user} {self.group}"
+
+    def as_json_dict(self) -> dict[str, Union[str, list[dict[str, str]]]]:
+        return {
+            "mode": oct(self.mode),
+            "user": self.user,
+            "group": self.group,
+            "xattrs": [{"key": xattr[0], "value": _str_b64_from_bytes(xattr[1])} for xattr in self.xattrs]
+        }
+
+class ApkFileKind(StrEnum):
+    REGULAR = "regular"
     SYMLINK = "symlink"
     HARDLINK = "hardlink"
     BLOCK = "block"
     CHAR = "char"
     FIFO = "fifo"
-    UNKNOWN = "unknown"
 
-@dataclass(frozen=True)
-class DirectoryEntry:
-    path: str
-    mode: int
-    user: Optional[str]
-    group: Optional[str]
-    path_idx: int
-    xattrs: list["XattrEntry"] = field(default_factory=list)
+@dataclass
+class ApkDev:
+    major: int
+    minor: int
 
-@dataclass(frozen=True)
-class XattrEntry:
-    name: str
-    value_hex: str
-    value_text: Optional[str]
+    @classmethod
+    def from_raw(cls, value: int) -> Self:
+        return cls(os.major(value), os.minor(value))
 
-@dataclass(frozen=True)
-class FileEntry:
-    path: str
-    name: str
-    path_idx: int
-    file_idx: int
-    kind: FileKind
-    size: int
-    mtime: int
-    mode: int
-    user: Optional[str]
-    group: Optional[str]
-    link_target: Optional[str]
-    device: Optional[int]
-    xattrs: list[XattrEntry] = field(default_factory=list)
-    hash_alg: Optional[str] = None
-    hash_hex: Optional[str] = None
+    def as_json_dict(self) -> dict[str, str]:
+        return {
+            "major": str(self.major),
+            "minor": str(self.minor),
+        }
 
-@dataclass(frozen=True)
-class PackageSchemaMeta:
-    schema: str = field(default="package", init=False)
-    metadata: PackageMetadata
-    dirs: list[DirectoryEntry]
-    files: list[FileEntry]
+@dataclass
+class ApkFile:
+    name: str = ""
+    acl: ApkAcl = field(default_factory=ApkAcl)
+    size: Optional[int] = None
+    mtime: Optional[int] = None
+    hashes: ApkHash = field(default_factory=ApkHash)
+    target: str = ""
+    kind: ApkFileKind = ApkFileKind.REGULAR
+    dev: Optional[ApkDev] = None
+
+    def as_json_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "acl": self.acl.as_json_dict(),
+            "size": _str_from_optional_int(self.size),
+            "mtime": _str_from_optional_int(self.mtime),
+            "hashes": self.hashes.as_json_dict(),
+            "target": self.target,
+            "kind": str(self.kind),
+            "dev": {} if self.dev is None else self.dev.as_json_dict()
+        }
+
+@dataclass
+class ApkDir:
+    name: str = ""
+    acl: ApkAcl = field(default_factory=ApkAcl)
+    files: list[ApkFile] = field(default_factory=list)
+
+    def as_json_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "acl": self.acl.as_json_dict(),
+            "files": [file.as_json_dict() for file in self.files]
+        }
+
+@dataclass
+class ApkPaths:
+    dirs: list[ApkDir] = field(default_factory=list)
+
+    def show(self):
+        logger.info("Paths:")
+        for id_directory, directory in enumerate(self.dirs, 1):
+            logger.info(f"{id_directory:3},    d{directory.acl.literal()}                                        {directory.name}/")
+            for id_file, file in enumerate(directory.files, 1):
+                target = ""
+                match file.kind:
+                    case ApkFileKind.REGULAR:
+                        char_type = "-"
+                        file_size = f"{file.size:13}"
+                    case ApkFileKind.SYMLINK:
+                        char_type = "l"
+                        target = f" -> {file.target}"
+                        file_size = " " * 13
+                    case ApkFileKind.HARDLINK:
+                        char_type = "-"
+                        target = f" -> {file.target}"
+                        file_size = " " * 13
+                    case ApkFileKind.BLOCK:
+                        char_type = "b"
+                        if file.dev is None:
+                            panic("Empty dev number for block device")
+                        file_size = f"{file.dev.major:6},{file.dev.minor:6}"
+                    case ApkFileKind.CHAR:
+                        char_type = "c"
+                        if file.dev is None:
+                            panic("Empty dev number for char device")
+                        file_size = f"{file.dev.major:6},{file.dev.minor:6}"
+                    case ApkFileKind.FIFO:
+                        char_type = "p"
+                        if file.dev is None:
+                            panic("Empty dev number for fifo device")
+                        file_size = f"{file.dev.major:6},{file.dev.minor:6}"
+                    case _:
+                        panic(f"Invalid File kind {file.kind}")
+                logger.info(f"{id_directory:3},{id_file:3} {char_type}{file.acl.literal()} {file_size} {time.ctime(file.mtime)} {directory.name}/{file.name}{target}")
+
+@dataclass
+class ApkScripts:
+    trigger: bytes = b""
+    preinst: bytes = b""
+    postinst: bytes = b""
+    predeinst: bytes = b""
+    postdeinst: bytes = b""
+    preupgrade: bytes = b""
+    postupgrade: bytes = b""
+
+    def show(self):
+        logger.info("Scripts:")
+        for key in ("trigger", "preinst", "postinst", "predeinst", "postdeinst", "preupgrade", "postupgrade"):
+            attr = getattr(self, key)
+            if attr:
+                len_attr = len(attr)
+                if len_attr > 50:
+                    peek = f"{attr[:25]} ... {attr[-25:]}"
+                else:
+                    peek = f"{attr}"
+                logger.info(f"{key} ({peek}) len={len_attr}")
+
+    def as_json_dict(self) -> dict[str, str]:
+        return {
+            "trigger": _str_b64_from_bytes(self.trigger),
+            "preinst": _str_b64_from_bytes(self.preinst),
+            "postinst": _str_b64_from_bytes(self.postinst),
+            "predeinst": _str_b64_from_bytes(self.predeinst),
+            "postdeinst": _str_b64_from_bytes(self.postdeinst),
+            "preupgrade": _str_b64_from_bytes(self.preupgrade),
+            "postupgrade": _str_b64_from_bytes(self.postupgrade),
+        }
+
+@dataclass
+class ApkMetainfo:
+    pkginfo: ApkPkginfo
+    paths: ApkPaths
+    scripts: ApkScripts
+
+    def as_json_dict(self) -> dict[str, Any]:
+        return {
+            "pkginfo": self.pkginfo.as_json_dict(),
+            "paths": [d.as_json_dict() for d in self.paths.dirs],
+            "scripts": self.scripts.as_json_dict(),
+        }
 
 SZ_CHUNK = 1024 * 1024 # 1 MiB
 
@@ -253,7 +520,7 @@ class AdbStream(ABC):
         while True:
             chunk = self.read(size - len_out)
             if not chunk:
-                panic(f"Truncated {what}", FormatError)
+                panic(f"Truncated {what}", ApkFormatError)
             out.extend(chunk)
             len_out = len(out)
             if len_out == size:
@@ -279,13 +546,13 @@ class AdbStream(ABC):
         while remaining > 0:
             chunk = self.read(min(remaining, SZ_CHUNK))
             if not chunk:
-                panic(f"Truncated {what}", FormatError)
+                panic(f"Truncated {what}", ApkFormatError)
             remaining -= len(chunk)
 
     def lossy_assert_raw(self):
         header = self.read_exact(4, "raw header")
         if header != b"ADB.":
-            panic(f"Inner raw stream is not b'ADB.' (BE 0x6164622E), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}{header[3]:x}", FormatError)
+            panic(f"Inner raw stream is not b'ADB.' (BE 0x6164622E), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}{header[3]:x}", ApkFormatError)
 
 class RawAdbStream(AdbStream):
     __slots__ = ("_file")
@@ -349,7 +616,7 @@ class _RingBuffer:
         size_first = min(len_out, len_buffer - self._head)
         out = self._buffer[self._head:self._head+size_first]
         if size_first < len_out:
-            out += self._buffer[0:len_out-size_first]
+            out.extend(self._buffer[0:len_out-size_first])
         self._head = (self._head + len_out) % len_buffer
         self._size -= len_out
         return out
@@ -398,7 +665,7 @@ class ZstandardAdbStream(AdbStream):
             if self._decompressor.needs_input:
                 in_chunk = self._file.read(SZ_CHUNK)
                 if not in_chunk:
-                    panic("Truncated zstd stream", FormatError)
+                    panic("Truncated zstd stream", ApkFormatError)
             else:
                 in_chunk = b""
 
@@ -406,7 +673,7 @@ class ZstandardAdbStream(AdbStream):
             if out_chunk:
                 self._buffer.write(out_chunk)
             elif self._decompressor.needs_input and not in_chunk:
-                panic("Truncated zstd stream", FormatError)
+                panic("Truncated zstd stream", ApkFormatError)
 
             if self._decompressor.eof:
                 self._eof = True
@@ -418,722 +685,633 @@ class ZstandardAdbStream(AdbStream):
         self._fill(size)
         return self._buffer.read(size)
 
-class AdbReader:
-    __slots__ = ("adb",)
+@dataclass(frozen=True)
+class AdbVal:
+    __slots__ = ("vtype", "value")
 
-    PKGINFO_DEP_FIELDS = {
-        int(AdbPkgInfoField.DEPENDS),
-        int(AdbPkgInfoField.PROVIDES),
-        int(AdbPkgInfoField.REPLACES),
-        int(AdbPkgInfoField.INSTALL_IF),
-        int(AdbPkgInfoField.RECOMMENDS),
-    }
-    PKGINFO_HEX_FIELDS = {
-        int(AdbPkgInfoField.HASHES),
-        int(AdbPkgInfoField.REPO_COMMIT),
-    }
+    vtype: AdbValType
+    value: int
 
-    def __init__(self, adb_payload: bytearray):
-        self.adb = adb_payload
+    @classmethod
+    def from_int(cls, u32: int) -> Self:
+        return cls(AdbValType(u32 & 0xF0000000), u32 & 0x0FFFFFFF)
 
-    # The highest 4 bits in a value mark is type, as defined in AdbValType
-    def _val_type(self, v: int) -> int:
-        return v & 0xF0000000
+    @classmethod
+    def must_init(cls, u32: int) -> Self:
+        if u32 == 0:
+            raise ValueError("Initializing AdbVal with 0")
+        return cls.from_int(u32)
 
-    # The lowest 28 bits in a value mark is type, as defined in AdbValType
-    def _val_data(self, v: int) -> int:
-        return v & 0x0FFFFFFF
+    @classmethod
+    def maybe_init(cls, u32: int) -> Optional[Self]:
+        if u32 == 0:
+            return None
+        return cls.from_int(u32)
 
-    def _u16(self, off: int) -> int:
-        if off + SZ_CU16 > len(self.adb):
-            panic(f"Truncated u16 at offset {off}", FormatError)
-        return Cu16.from_buffer(self.adb, off).value
+    @classmethod
+    def in_values(cls, values: Sequence[Optional[Self]], index: AdbField) -> Optional[Self]:
+        if index > 0 and index <= len(values):
+            return values[index - 1]
+        return None
 
-    def _u32(self, off: int) -> int:
-        if off + SZ_CU32 > len(self.adb):
-            panic(f"Truncated u32 at offset {off}", FormatError)
-        return Cu32.from_buffer(self.adb, off).value
+def _uint_from(data: bytes | bytearray) -> int:
+    return int.from_bytes(data, "little", signed=False)
 
-    def _u64(self, off: int) -> int:
-        if off + SZ_CU64 > len(self.adb):
-            panic(f"Truncated u64 at offset {off}", FormatError)
-        return Cu64.from_buffer(self.adb, off).value
+class AdbBlockAdbReader:
+    __slots__ = ("data",)
 
-    def read_int(self, v: int) -> Optional[int]:
-        t = self._val_type(v)
-        off = self._val_data(v)
-        match t:
+    def __init__(self, data: bytearray):
+        self.data = data
+
+    def u8_at(self, offset: int) -> int:
+        return _uint_from(self.data[offset:offset+1])
+
+    def u16_at(self, offset: int) -> int:
+        return _uint_from(self.data[offset:offset+2])
+
+    def u32_at(self, offset: int) -> int:
+        return _uint_from(self.data[offset:offset+4])
+
+    def u64_at(self, offset: int) -> int:
+        return _uint_from(self.data[offset:offset+8])
+
+    def read_uint(self, header: AdbVal) -> int:
+        match header.vtype:
             case AdbValType.INT:
-                return off
+                return header.value
             case AdbValType.INT32:
-                return self._u32(off)
+                return self.u32_at(header.value)
             case AdbValType.INT64:
-                return self._u64(off)
+                return self.u64_at(header.value)
             case _:
-                return None
+                panic(f"Reading a non INT (type {header.vtype}) for BLOB")
 
-    def read_blob(self, v: int) -> Optional[bytes]:
-        t = self._val_type(v)
-        off = self._val_data(v)
-        match t:
+    def read_blob(self, header: AdbVal) -> bytearray:
+        match header.vtype:
             case AdbValType.BLOB8:
-                if off >= len(self.adb):
-                    panic(f"Truncated blob8 length at offset {off}", FormatError)
-                length = self.adb[off]
-                start = off + 1
+                count = self.u8_at(header.value)
+                skip = 1
             case AdbValType.BLOB16:
-                length = self._u16(off)
-                start = off + 2
+                count = self.u16_at(header.value)
+                skip = 2
             case AdbValType.BLOB32:
-                length = self._u32(off)
-                start = off + 4
+                count = self.u32_at(header.value)
+                skip = 4
             case _:
-                return None
-        end = start + length
-        if end > len(self.adb):
-            panic(f"Blob at offset {off} exceeds ADB payload", FormatError)
-        return bytes(self.adb[start:end])
+                panic(f"Reading a non BLOB (type {header.vtype}) for BLOB")
+        if count == 0:
+            return bytearray()
+        offset = header.value + skip
+        return self.data[offset:offset+count]
 
-    def read_obj(self, v: int) -> list[int]:
-        t = self._val_type(v)
-        if t != AdbValType.ARRAY and t != AdbValType.OBJECT:
-            panic(f"Expected object/array value, got type {t:#x}", FormatError)
-        off = self._val_data(v)
-        num = self._u32(off)
-        if num == 0:
-            panic(f"Invalid zero-sized object/array at offset {off}", FormatError)
-        end = off + num * SZ_CU32
-        if end > len(self.adb):
-            panic(f"Object/array at offset {off} exceeds ADB payload", FormatError)
-        return [Cu32.from_buffer(self.adb, off + i * SZ_CU32).value for i in range(num)]
+    def read_bytes(self, header: AdbVal) -> bytes:
+        return bytes(self.read_blob(header))
 
-    @staticmethod
-    def obj_get(obj: list[int], index: AdbField) -> int:
-        if index < len(obj):
-            return obj[index]
-        return 0
+    def read_text(self, header: AdbVal) -> str:
+        return self.read_blob(header).decode("utf-8")
 
-    @staticmethod
-    def blob_to_text(blob: Optional[bytes]) -> Optional[str]:
-        if blob is None:
-            return None
-        try:
-            return blob.decode("utf-8")
-        except UnicodeDecodeError:
-            return blob.hex()
+    def read_values(self, header: AdbVal) -> list[Optional[AdbVal]]:
+        if header.vtype != AdbValType.ARRAY and header.vtype != AdbValType.OBJECT:
+            panic(f"Expected object/array value, got type {header.vtype:#x}", ApkFormatError)
+        count = self.u32_at(header.value)
+        return [AdbVal.maybe_init(self.u32_at(header.value + i * 4)) for i in range(1, count)]
 
-    def _parse_dep(self, dep_tag: int) -> Optional[str]:
-        dep = self.read_obj(dep_tag)
-        name = self.blob_to_text(self.read_blob(self.obj_get(dep, AdbDepField.NAME)))
-        ver = self.blob_to_text(self.read_blob(self.obj_get(dep, AdbDepField.VERSION)))
-        op = self.read_int(self.obj_get(dep, AdbDepField.MATCH))
-        if name is None:
-            return None
-        if ver:
-            if op:
-                match op & ~ApkVersionFlag.CONFLICT:
-                    case int(ApkVersionFlag.LESS):
-                        sign = "<"
-                    case int(ApkVersionFlag.LESS | ApkVersionFlag.EQUAL):
-                        sign = "<="
-                    case int(ApkVersionFlag.LESS | ApkVersionFlag.EQUAL | ApkVersionFlag.FUZZY):
-                        sign = "<~"
-                    case int(ApkVersionFlag.FUZZY):
-                        sign = "~"
-                    case int(ApkVersionFlag.EQUAL):
-                        sign = "="
-                    case int(ApkVersionFlag.GREATER | ApkVersionFlag.EQUAL):
-                        sign = ">="
-                    case int(ApkVersionFlag.GREATER | ApkVersionFlag.EQUAL | ApkVersionFlag.FUZZY):
-                        sign = ">~"
-                    case int(ApkVersionFlag.GREATER):
-                        sign = ">"
-                    case _:
-                        panic(f"Invalid dep op {op}")
-                return f"{'!' if op & ApkVersionFlag.CONFLICT else ''}{name}{sign}{ver}"
-            else:
-                return f"{name}={ver}"
+    def read_depend(self, header: AdbVal) -> ApkDepend:
+        depend = ApkDepend()
+        for id_value, value in enumerate(self.read_values(header), 1):
+            if value is None:
+                continue
+            id_field = AdbDepField(id_value)
+            match id_field:
+                case AdbDepField.NAME:
+                    depend.name = self.read_text(value)
+                case AdbDepField.VERSION:
+                    depend.version = self.read_text(value)
+                case AdbDepField.MATCH:
+                    depend.match = self.read_uint(value)
+                case _:
+                    panic(f"Unexpected field {id_field} in depend")
+        return depend
+
+    def read_depends(self, header: AdbVal) -> list[ApkDepend]:
+        return [self.read_depend(value) for value in self.read_values(header) if value is not None]
+
+    def read_pkginfo(self, header: AdbVal) -> ApkPkginfo:
+        info = ApkPkginfo()
+        for id_value, value in enumerate(self.read_values(header), 1):
+            if value is None:
+                continue
+            id_field = AdbPkgInfoField(id_value)
+            match id_field:
+                case AdbPkgInfoField.NAME:
+                    info.name = self.read_text(value)
+                case AdbPkgInfoField.VERSION:
+                    info.version = self.read_text(value)
+                case AdbPkgInfoField.HASHES:
+                    info.hashes = ApkHash.from_raw(self.read_blob(value))
+                case AdbPkgInfoField.DESCRIPTION:
+                    info.description = self.read_text(value)
+                case AdbPkgInfoField.ARCH:
+                    info.arch = self.read_text(value)
+                case AdbPkgInfoField.LICENSE:
+                    info.license = self.read_text(value)
+                case AdbPkgInfoField.ORIGIN:
+                    info.origin = self.read_text(value)
+                case AdbPkgInfoField.MAINTAINER:
+                    info.maintainer = self.read_text(value)
+                case AdbPkgInfoField.URL:
+                    info.url = self.read_text(value)
+                case AdbPkgInfoField.REPO_COMMIT:
+                    info.repo_commit = self.read_bytes(value)
+                case AdbPkgInfoField.BUILD_TIME:
+                    info.build_time = self.read_uint(value)
+                case AdbPkgInfoField.INSTALLED_SIZE:
+                    info.installed_size = self.read_uint(value)
+                case AdbPkgInfoField.FILE_SIZE:
+                    info.file_size = self.read_uint(value)
+                case AdbPkgInfoField.PROVIDER_PRIORITY:
+                    info.provider_priority = self.read_uint(value)
+                case AdbPkgInfoField.DEPENDS:
+                    info.depends = self.read_depends(value)
+                case AdbPkgInfoField.PROVIDES:
+                    info.provides = self.read_depends(value)
+                case AdbPkgInfoField.REPLACES:
+                    info.replaces = self.read_depends(value)
+                case AdbPkgInfoField.INSTALL_IF:
+                    info.install_if = self.read_depends(value)
+                case AdbPkgInfoField.RECOMMENDS:
+                    info.recommends = self.read_depends(value)
+                case AdbPkgInfoField.LAYER:
+                    info.layer = self.read_uint(value)
+                case AdbPkgInfoField.TAGS:
+                    info.tags = ["" if sub_value is None else self.read_text(sub_value) for sub_value in self.read_values(value)]
+                case _:
+                    panic(f"Unexpected field {id_field} in pkginfo")
+        return info
+
+    def read_acl(self, header: AdbVal) -> ApkAcl:
+        acl = ApkAcl()
+        for id_value, value in enumerate(self.read_values(header), 1):
+            if value is None:
+                continue
+            id_field = AdbAclField(id_value)
+            match id_field:
+                case AdbAclField.MODE:
+                    acl.mode = self.read_uint(value)
+                case AdbAclField.USER:
+                    acl.user = self.read_text(value)
+                case AdbAclField.GROUP:
+                    acl.group = self.read_text(value)
+                case AdbAclField.XATTRS:
+                    for id_sub, sub_value in enumerate(self.read_values(value), 1):
+                        if sub_value is None:
+                            panic(f"Empty XATTR entry (ID {id_sub}) not allowed", ApkFormatError)
+                        if sub_value.vtype != AdbValType.BLOB8:
+                            panic(f"XATTR entry is not BLOB8 but {sub_value.vtype}", ApkFormatError)
+                        parts = self.read_blob(sub_value).split(b"\x00", 1)
+                        if len(parts) != 2:
+                            panic(f"XATTR entry does not have NULL byte as sep")
+                        acl.xattrs.append((parts[0].decode(), bytes(parts[1])))
+        return acl
+
+    def read_file(self, header: AdbVal) -> ApkFile:
+        file = ApkFile()
+        for id_value, value in enumerate(self.read_values(header), 1):
+            if value is None:
+                continue
+            id_field = AdbFileField(id_value)
+            match id_field:
+                case AdbFileField.NAME:
+                    file.name = self.read_text(value)
+                case AdbFileField.ACL:
+                    file.acl = self.read_acl(value)
+                case AdbFileField.SIZE:
+                    file.size = self.read_uint(value)
+                case AdbFileField.MTIME:
+                    file.mtime = self.read_uint(value)
+                case AdbFileField.HASHES:
+                    file.hashes = ApkHash.from_raw(self.read_blob(value))
+                case AdbFileField.TARGET:
+                    target = self.read_blob(value)
+                    file_ifmt = stat.S_IFMT(_uint_from(target[0:2]))
+                    match file_ifmt:
+                        case stat.S_IFLNK:
+                            file.kind = ApkFileKind.SYMLINK
+                            is_dev = False
+                        case stat.S_IFREG:
+                            file.kind = ApkFileKind.HARDLINK
+                            is_dev = False
+                        case stat.S_IFBLK:
+                            file.kind = ApkFileKind.BLOCK
+                            is_dev = True
+                        case stat.S_IFCHR:
+                            file.kind = ApkFileKind.CHAR
+                            is_dev = True
+                        case stat.S_IFIFO:
+                            file.kind = ApkFileKind.FIFO
+                            is_dev = True
+                        case _:
+                            panic(f"Invalid file type {file_ifmt:x} for special file {file.name}", ApkFormatError)
+                    if is_dev:
+                        if len(target) != 10:
+                            panic(f"Invalid device/fifo target blob length for special file {file.name}", ApkFormatError)
+                        file.dev = ApkDev.from_raw(_uint_from(target[2:10]))
+                    else:
+                        file.target = target[2:].decode("utf-8")
+        return file
+
+    def read_dir(self, header: AdbVal) -> ApkDir:
+        directory = ApkDir()
+        for id_value, value in enumerate(self.read_values(header), 1):
+            if value is None:
+                continue
+            id_field = AdbDirField(id_value)
+            match id_field:
+                case AdbDirField.NAME:
+                    directory.name = self.read_text(value)
+                case AdbDirField.ACL:
+                    directory.acl = self.read_acl(value)
+                case AdbDirField.FILES:
+                    for id_sub, sub_value in enumerate(self.read_values(value), 1):
+                        if sub_value is None:
+                            panic(f"Empty FILE entry (ID {id_sub}) not allowed", ApkFormatError)
+                        if sub_value.vtype != AdbValType.OBJECT:
+                            panic(f"FILE entry is not OBJECT but {sub_value.vtype}", ApkFormatError)
+                        directory.files.append(self.read_file(sub_value))
+                case _:
+                    panic(f"Unexpected field {id_field} in dir")
+        return directory
+
+    def read_paths(self, header: AdbVal) -> ApkPaths:
+        paths = ApkPaths()
+        for id_value, value in enumerate(self.read_values(header), 1):
+            if value is None:
+                panic(f"Empty PATHS entry (ID {id_value}) not allowed", ApkFormatError)
+            if AdbValType.OBJECT != value.vtype:
+                panic(f"ADB PATHS entry should be OBJECT, but it was {value.vtype} instead")
+            paths.dirs.append(self.read_dir(value))
+        return paths
+
+    def read_scripts(self, header: AdbVal) -> ApkScripts:
+        scripts = ApkScripts()
+        for id_value, value in enumerate(self.read_values(header), 1):
+            if value is None:
+                continue
+            id_field = AdbScriptField(id_value)
+            match id_field:
+                case AdbScriptField.TRIGGER:
+                    scripts.trigger = self.read_bytes(value)
+                case AdbScriptField.PREINST:
+                    scripts.preinst = self.read_bytes(value)
+                case AdbScriptField.POSTINST:
+                    scripts.postinst = self.read_bytes(value)
+                case AdbScriptField.PREDEINST:
+                    scripts.predeinst = self.read_bytes(value)
+                case AdbScriptField.POSTDEINST:
+                    scripts.postdeinst = self.read_bytes(value)
+                case AdbScriptField.PREUPGRADE:
+                    scripts.preupgrade = self.read_bytes(value)
+                case AdbScriptField.POSTUPGRADE:
+                    scripts.postupgrade = self.read_bytes(value)
+                case _:
+                    panic(f"Unexpected field {id_field} in scripts")
+        return scripts
+
+    def parse(self) -> ApkMetainfo:
+        root = _uint_from(self.data[4:8])
+        if root == 0:
+            panic("ADB has a root field with 0, the whole package shall be omitted")
+
+        value_root = AdbVal.from_int(root)
+        if value_root.vtype != AdbValType.OBJECT:
+            panic(f"ADB root is not OBJECT but {value_root.vtype}", ApkFormatError)
+
+        values_package = self.read_values(value_root)
+
+        value_pkginfo = AdbVal.in_values(values_package, AdbPkgField.PKGINFO)
+        if value_pkginfo is None:
+            panic(f"ADB pkginfo does not exist, which is not allowed", ApkFormatError)
+        elif value_pkginfo.vtype != AdbValType.OBJECT:
+            panic(f"ADB pkginfo is not OBJECT but {value_pkginfo.vtype}", ApkFormatError)
+        pkginfo = self.read_pkginfo(value_pkginfo)
+        pkginfo.show()
+
+        value_paths = AdbVal.in_values(values_package, AdbPkgField.PATHS)
+        if value_paths is None:
+            paths = ApkPaths()
+        elif value_paths.vtype != AdbValType.OBJECT:
+            panic(f"ADB paths is not OBJECT but {value_paths.vtype}", ApkFormatError)
         else:
-            return ("!" if op and op & ApkVersionFlag.CONFLICT else "") + name
+            paths = self.read_paths(value_paths)
+            paths.show()
 
-    def _parse_dep_array(self, arr_tag: int) -> list[str]:
-        out = []
-        arr = self.read_obj(arr_tag)
-        for i in range(1, len(arr)):
-            tag = arr[i]
-            if tag == 0:
-                continue
-            dep = self._parse_dep(tag)
-            if dep is not None:
-                out.append(dep)
-        return out
-
-    def _parse_string_array(self, arr_tag: int) -> list[str]:
-        out = []
-        arr = self.read_obj(arr_tag)
-        for i in range(1, len(arr)):
-            tag = arr[i]
-            if tag == 0:
-                continue
-            text = self.blob_to_text(self.read_blob(tag))
-            if text is not None:
-                out.append(text)
-        return out
-
-    def _parse_pkginfo(self, pkginfo_tag: int) -> PackageMetadata:
-        meta: PackageMetadata = {}
-        obj = self.read_obj(pkginfo_tag)
-        for idx in range(1, len(obj)):
-            tag = obj[idx]
-            if tag == 0:
-                continue
-            name = str(AdbPkgInfoField(idx))
-            if idx in self.PKGINFO_DEP_FIELDS:
-                meta[name] = self._parse_dep_array(tag)
-                continue
-            if idx == int(AdbPkgInfoField.TAGS):
-                meta[name] = self._parse_string_array(tag)
-                continue
-            ival = self.read_int(tag)
-            if ival is not None:
-                meta[name] = ival
-                continue
-            blob = self.read_blob(tag)
-            if blob is None:
-                continue
-            if idx in self.PKGINFO_HEX_FIELDS:
-                meta[name] = blob.hex()
-            else:
-                text = self.blob_to_text(blob)
-                if text is not None:
-                    meta[name] = text
-        return meta
-
-    def _parse_xattrs(self, xattr_tag: int) -> list[XattrEntry]:
-        if xattr_tag == 0:
-            return []
-        out: list[XattrEntry] = []
-        arr = self.read_obj(xattr_tag)
-        for i in range(1, len(arr)):
-            tag = arr[i]
-            if tag == 0:
-                continue
-            blob = self.read_blob(tag)
-            if blob is None:
-                continue
-            sep = blob.find(b"\x00")
-            if sep < 0:
-                panic("Invalid ACL xattr entry missing NUL separator", FormatError)
-            name_raw = blob[:sep]
-            value_raw = blob[sep + 1:]
-            name = self.blob_to_text(name_raw)
-            if name is None:
-                panic("Invalid ACL xattr name", FormatError)
-            out.append(XattrEntry(
-                name=name,
-                value_hex=value_raw.hex(),
-                value_text=self.blob_to_text(value_raw),
-            ))
-        return out
-
-    @staticmethod
-    def _parse_hash(hash_blob: Optional[bytes]) -> tuple[Optional[str], Optional[str]]:
-        if not hash_blob:
-            return None, None
-        alg = {
-            20: "SHA1",
-            32: "SHA256",
-            64: "SHA512",
-        }.get(len(hash_blob))
-        return alg, hash_blob.hex()
-
-    def _parse_acl(self, acl_tag: int, default_mode: int) -> tuple[int, Optional[str], Optional[str], list[XattrEntry]]:
-        if acl_tag == 0:
-            return default_mode, None, None, []
-        acl = self.read_obj(acl_tag)
-        mode = self.read_int(self.obj_get(acl, AdbAclField.MODE))
-        user = self.blob_to_text(self.read_blob(self.obj_get(acl, AdbAclField.USER)))
-        group = self.blob_to_text(self.read_blob(self.obj_get(acl, AdbAclField.GROUP)))
-        xattrs = self._parse_xattrs(self.obj_get(acl, AdbAclField.XATTRS))
-        return (default_mode if mode is None else int(mode)), user, group, xattrs
-
-    @staticmethod
-    def _parse_target_blob(target: Optional[bytes]) -> tuple[FileKind, Optional[str], Optional[int]]:
-        if not target:
-            return FileKind.FILE, None, None
-        if len(target) < 2:
-            panic("Invalid target blob too short", FormatError)
-        tmode = int.from_bytes(target[0:2], "little")
-        payload = target[2:]
-        ftype = stat.S_IFMT(tmode)
-        match ftype:
-            case stat.S_IFLNK:
-                fkind = FileKind.SYMLINK
-                dev = False
-            case stat.S_IFREG:
-                fkind = FileKind.HARDLINK
-                dev = False
-            case stat.S_IFBLK:
-                fkind = FileKind.BLOCK
-                dev = True
-            case stat.S_IFCHR:
-                fkind = FileKind.CHAR
-                dev = True
-            case stat.S_IFIFO:
-                fkind = FileKind.FIFO
-                dev = True
-            case _:
-                panic(f"Unsupported ftype {ftype} in TARGET", FormatError)
-        if dev:
-            if len(payload) != 8:
-                panic("Invalid device/fifo target blob length", FormatError)
-            return fkind, None, int.from_bytes(payload, "little")
+        value_scripts = AdbVal.in_values(values_package, AdbPkgField.SCRIPTS)
+        if value_scripts is None:
+            scripts = ApkScripts()
+        elif value_scripts.vtype != AdbValType.OBJECT:
+            panic(f"ADB scripts is not OBJECT but {value_scripts}", ApkFormatError)
         else:
-            return fkind, payload.decode("utf-8"), None
+            scripts = self.read_scripts(value_scripts)
+            scripts.show()
 
-    def parse_package(self) -> tuple[PackageMetadata, list[DirectoryEntry], list[FileEntry], dict[tuple[int, int], FileEntry]]:
-        if len(self.adb) < SZ_CADB_HDR:
-            panic("ADB payload too small for header", FormatError)
-        hdr = CAdbHdr.from_buffer(self.adb)
-        pkg = self.read_obj(hdr.root)
-
-        metadata: PackageMetadata = {}
-        pkginfo_tag = self.obj_get(pkg, AdbPkgField.PKGINFO)
-        if pkginfo_tag != 0:
-            metadata = self._parse_pkginfo(pkginfo_tag)
-
-        dirs: list[DirectoryEntry] = []
-        file_entries: list[FileEntry] = []
-        file_lookup: dict[tuple[int, int], FileEntry] = {}
-        paths_tag = self.obj_get(pkg, AdbPkgField.PATHS)
-        if paths_tag == 0:
-            return metadata, dirs, file_entries, file_lookup
-
-        paths = self.read_obj(paths_tag)
-        for path_idx in range(1, len(paths)):
-            path_tag = paths[path_idx]
-            if path_tag == 0:
-                continue
-            path = self.read_obj(path_tag)
-            path_name = self.blob_to_text(self.read_blob(self.obj_get(path, AdbDirField.NAME))) or ""
-            dmode, duser, dgroup, dxattrs = self._parse_acl(self.obj_get(path, AdbDirField.ACL), 0o755)
-            dirs.append(DirectoryEntry(
-                path=path_name,
-                mode=dmode,
-                user=duser,
-                group=dgroup,
-                path_idx=path_idx,
-                xattrs=dxattrs,
-            ))
-            files_tag = self.obj_get(path, AdbDirField.FILES)
-            if files_tag == 0:
-                continue
-            file_arr = self.read_obj(files_tag)
-            for file_idx in range(1, len(file_arr)):
-                file_tag = file_arr[file_idx]
-                if file_tag == 0:
-                    continue
-                file_obj = self.read_obj(file_tag)
-                file_name = self.blob_to_text(self.read_blob(self.obj_get(file_obj, AdbFileField.NAME)))
-                if file_name is None:
-                    continue
-                full = f"{path_name}/{file_name}" if path_name else file_name
-                fmode, fuser, fgroup, fxattrs = self._parse_acl(self.obj_get(file_obj, AdbFileField.ACL), 0o644)
-                fsize = self.read_int(self.obj_get(file_obj, AdbFileField.SIZE))
-                fmtime = self.read_int(self.obj_get(file_obj, AdbFileField.MTIME))
-                fhash_alg, fhash_hex = self._parse_hash(self.read_blob(self.obj_get(file_obj, AdbFileField.HASHES)))
-                target_blob = self.read_blob(self.obj_get(file_obj, AdbFileField.TARGET))
-                fkind, flink, fdev = self._parse_target_blob(target_blob)
-                info = FileEntry(
-                    path=full,
-                    name=file_name,
-                    path_idx=path_idx,
-                    file_idx=file_idx,
-                    kind=fkind,
-                    size=0 if fsize is None else int(fsize),
-                    mtime=0 if fmtime is None else int(fmtime),
-                    mode=fmode,
-                    user=fuser,
-                    group=fgroup,
-                    link_target=flink,
-                    device=fdev,
-                    xattrs=fxattrs,
-                    hash_alg=fhash_alg,
-                    hash_hex=fhash_hex,
-                )
-                file_entries.append(info)
-                file_lookup[(path_idx, file_idx)] = info
-        return metadata, dirs, file_entries, file_lookup
-
-class _TarDataStream:
-    def __init__(self, stream: AdbStream, size: int):
-        self._stream = stream
-        self._remaining = size
-
-    def read(self, size: int = -1) -> bytes:
-        if self._remaining <= 0:
-            return b""
-        if size < 0 or size > self._remaining:
-            size = self._remaining
-        data = self._stream.read_exact(size, "DATA payload")
-        self._remaining -= len(data)
-        return bytes(data)
-
-class TarEmitter:
-    NOBODY_ID = 65534
-    USER_TO_UID = {
-        "root": 0,
-        "nobody": 65534,
-    }
-    GROUP_TO_GID = {
-        "root": 0,
-        "nobody": 65534,
-        "nogroup": 65534,
-    }
-
-    def __init__(self, tar: tarfile.TarFile):
-        self.tar = tar
-        self.seen_dirs: set[str] = set()
-
-    @staticmethod
-    def _safe_pax_component(name: str) -> str:
-        if all(0x20 <= ord(ch) <= 0x7E and ch not in "=\n" for ch in name):
-            return name
-        return f"hex:{name.encode('utf-8', errors='replace').hex()}"
-
-    @staticmethod
-    def _tarinfo_base(
-        name: str,
-        mode: int,
-        mtime: int,
-        user: Optional[str] = None,
-        group: Optional[str] = None,
-        uid: int = 0,
-        gid: int = 0,
-        pax_headers: Optional[dict[str, str]] = None,
-    ) -> tarfile.TarInfo:
-        ti = tarfile.TarInfo(name=name)
-        ti.mode = mode & 0o7777
-        ti.mtime = int(mtime)
-        ti.uid = int(uid)
-        ti.gid = int(gid)
-        if user:
-            ti.uname = user
-        if group:
-            ti.gname = group
-        if pax_headers:
-            ti.pax_headers = pax_headers
-        return ti
-
-    @classmethod
-    def _resolve_uid(cls, user: Optional[str]) -> int:
-        return cls.USER_TO_UID.get(user, 0) if user else 0
-
-    @classmethod
-    def _resolve_gid(cls, group: Optional[str]) -> int:
-        return cls.GROUP_TO_GID.get(group, 0) if group else 0
-
-    @classmethod
-    def _build_pax_headers(
-        cls,
-        xattrs: list[XattrEntry],
-        hash_alg: Optional[str] = None,
-        hash_hex: Optional[str] = None,
-    ) -> dict[str, str]:
-        headers: dict[str, str] = {}
-        for x in xattrs:
-            key = cls._safe_pax_component(x.name)
-            headers[f"SCHILY.xattr.{key}"] = x.value_text if x.value_text is not None else f"hex:{x.value_hex}"
-        if hash_hex and hash_alg:
-            headers[f"APK-TOOLS.checksum.{hash_alg}"] = hash_hex
-        return headers
-
-    @classmethod
-    def _tarinfo_file(cls, f: FileEntry, pax_headers: dict[str, str]) -> tarfile.TarInfo:
-        return cls._tarinfo_base(
-            f.path,
-            f.mode,
-            f.mtime,
-            user=f.user,
-            group=f.group,
-            uid=cls._resolve_uid(f.user),
-            gid=cls._resolve_gid(f.group),
-            pax_headers=pax_headers,
-        )
-
-    def _add_parent_dirs(self, path: str):
-        parts = Path(path).parts[:-1]
-        current = ""
-        for part in parts:
-            current = f"{current}/{part}" if current else part
-            if current in self.seen_dirs:
-                continue
-            ti = self._tarinfo_base(f"{current}/", 0o755, 0, user="root", group="root", uid=0, gid=0)
-            ti.type = tarfile.DIRTYPE
-            ti.size = 0
-            self.tar.addfile(ti)
-            self.seen_dirs.add(current)
-
-    def add_dir(self, d: DirectoryEntry):
-        path = d.path
-        if not path or path in self.seen_dirs:
-            return
-        self._add_parent_dirs(path)
-        ti = self._tarinfo_base(
-            f"{path}/",
-            d.mode,
-            0,
-            user=d.user,
-            group=d.group,
-            uid=self._resolve_uid(d.user),
-            gid=self._resolve_gid(d.group),
-            pax_headers=self._build_pax_headers(d.xattrs),
-        )
-        ti.type = tarfile.DIRTYPE
-        ti.size = 0
-        self.tar.addfile(ti)
-        self.seen_dirs.add(path)
-
-    def add_nondata_file(self, f: FileEntry):
-        kind = f.kind
-        path = f.path
-        pax_headers = self._build_pax_headers(
-            f.xattrs,
-            hash_alg=f.hash_alg,
-            hash_hex=f.hash_hex,
-        )
-        self._add_parent_dirs(path)
-        match kind:
-            case FileKind.FILE:
-                if f.size == 0:
-                    ti = self._tarinfo_file(f, pax_headers)
-                    ti.size = 0
-                    self.tar.addfile(ti, io.BytesIO())
-            case FileKind.SYMLINK:
-                ti = self._tarinfo_file(f, pax_headers)
-                ti.type = tarfile.SYMTYPE
-                ti.linkname = f.link_target or ""
-                ti.size = 0
-                self.tar.addfile(ti)
-            case FileKind.HARDLINK:
-                ti = self._tarinfo_file(f, pax_headers)
-                ti.type = tarfile.LNKTYPE
-                ti.linkname = f.link_target or ""
-                ti.size = 0
-                self.tar.addfile(ti)
-            case FileKind.BLOCK:
-                if f.device is None:
-                    panic(f"BLOCK file missing device number: '{path}'", FormatError)
-                ti = self._tarinfo_file(f, pax_headers)
-                ti.type = tarfile.BLKTYPE
-                ti.devmajor = os.major(f.device)
-                ti.devminor = os.minor(f.device)
-                ti.size = 0
-                self.tar.addfile(ti)
-            case FileKind.CHAR:
-                if f.device is None:
-                    panic(f"CHAR file missing device number: '{path}'", FormatError)
-                ti = self._tarinfo_file(f, pax_headers)
-                ti.type = tarfile.CHRTYPE
-                ti.devmajor = os.major(f.device)
-                ti.devminor = os.minor(f.device)
-                ti.size = 0
-                self.tar.addfile(ti)
-            case FileKind.FIFO:
-                ti = self._tarinfo_file(f, pax_headers)
-                ti.type = tarfile.FIFOTYPE
-                ti.size = 0
-                self.tar.addfile(ti)
-            case _:
-                panic(f"Invalid file type to add: {kind}", FormatError)
-
-    def add_data_file_stream(self, f: FileEntry, data_len: int, stream: AdbStream):
-        self._add_parent_dirs(f.path)
-        ti = self._tarinfo_file(
-            f,
-            self._build_pax_headers(
-                f.xattrs,
-                hash_alg=f.hash_alg,
-                hash_hex=f.hash_hex,
-            ),
-        )
-        ti.size = data_len
-        self.tar.addfile(ti, _TarDataStream(stream, data_len))
+        return ApkMetainfo(pkginfo, paths, scripts)
 
 @dataclass(frozen=True)
-class BlockDesc:
-    block_type: int
-    raw_size: int
-    payload_size: int
+class AdbBlock:
+    type_block: AdbBlockType
+    size_raw: int
+    size_payload: int
 
-class ApkDumper:
-    def __init__(self, stream: AdbStream, tar: tarfile.TarFile, meta_schemas: list[PackageSchemaMeta]):
+class AdbStreamSlice:
+    def __init__(self, stream: AdbStream, size: int):
         self.stream = stream
-        self.tar_writer = TarEmitter(tar)
-        self.meta_schemas = meta_schemas
-        self._blk_index = 0
-        self._file_lookup: dict[tuple[int, int], FileEntry] = {}
-        self._written_data: set[tuple[int, int]] = set()
+        self.remain = size
 
-    def _read_block_desc(self) -> Optional[BlockDesc]:
-        type_size_raw = self.stream.read_exact_or_none(SZ_CU32, "block type/size")
-        if type_size_raw is None:
-            return None
+    def read(self, size: int = -1) -> bytes | bytearray:
+        if self.remain <= 0:
+            return b""
+        if size < 0 or size > self.remain:
+            size = self.remain
+        data = self.stream.read_exact(size, "slice")
+        self.remain -= len(data)
+        return data
 
-        type_size = Cu32.from_buffer(type_size_raw).value
-        block_type = type_size >> 30
-        if block_type == AdbBlockType.EXT:
-            ext = self.stream.read_exact(SZ_CADB_BLOCK - SZ_CU32, "extended block header")
-            blk = CAdbBlock.from_buffer(type_size_raw + ext)
-            block_type = type_size & 0x3fffffff
-            raw_size = blk.x_size
-            hdr_size = SZ_CADB_BLOCK
-        else:
-            raw_size = type_size & 0x3fffffff
-            hdr_size = SZ_CU32
-
-        if raw_size < hdr_size:
-            panic(f"Invalid block raw size {raw_size}", FormatError)
-        return BlockDesc(block_type=block_type, raw_size=raw_size, payload_size=raw_size - hdr_size)
-
-    def _read_first_adb_block_desc(self) -> BlockDesc:
-        self._blk_index = 0
-        blk = self._read_block_desc()
-        if blk is None:
-            panic("ADB stream did not contain an ADB block", FormatError)
-        if blk.block_type != AdbBlockType.ADB:
-            if blk.block_type == AdbBlockType.SIG:
-                panic("Invalid block order: SIG block position", FormatError)
-            if blk.block_type == AdbBlockType.DATA:
-                panic("Invalid block order: DATA before ADB", FormatError)
-            panic(f"Unknown block type {blk.block_type}", FormatError)
-        return blk
-
-    def _read_next_block_desc(self, last_raw_size: int) -> Optional[BlockDesc]:
-        pad_remainder = last_raw_size & 0x7
-        if pad_remainder:
-            self.stream.skip(8 - pad_remainder, "block padding")
-        blk = self._read_block_desc()
-        if blk is not None:
-            self._blk_index += 1
-        return blk
-
-    def _handle_adb_block(self, schema: int, payload_size: int):
-        if payload_size < SZ_CADB_HDR:
-            panic("ADB block payload too small", FormatError)
-        adb_payload = self.stream.read_exact(payload_size, "ADB block payload")
-        adb_hdr = CAdbHdr.from_buffer(adb_payload)
-        logger.info(
-            f"  [{self._blk_index}] ADB payload={payload_size} compat={adb_hdr.adb_compat_ver} ver={adb_hdr.adb_ver}"
-        )
-
-        if schema != AdbSchema.PACKAGE:
-            self._file_lookup = {}
-            return
-
-        metadata, dirs, files, file_lookup = AdbReader(adb_payload).parse_package()
-        self._file_lookup = file_lookup
-        self.meta_schemas.append(PackageSchemaMeta(
-            metadata=metadata,
-            dirs=dirs,
-            files=files,
-        ))
-        if metadata:
-            logger.info("    package metadata:")
-            for key, value in metadata.items():
-                logger.info(f"      {key}: {value}")
-        else:
-            logger.info("    package metadata: (none)")
-        logger.info(f"    all file paths ({len(files)}):")
-        for f in files:
-            logger.info(f"      {f.path}")
-
-        for d in dirs:
-            self.tar_writer.add_dir(d)
-        for f in files:
-            self.tar_writer.add_nondata_file(f)
-
-    def _handle_sig_block(self, payload_size: int):
-        if payload_size < SZ_CADB_SIGN_HDR:
-            panic("SIG block payload too small", FormatError)
-        sig_payload = self.stream.read_exact(payload_size, "SIG block payload")
-        sig = CAdbSignHdr.from_buffer(sig_payload)
-        logger.info(
-            f"  [{self._blk_index}] SIG payload={payload_size} sign_v={sig.sign_ver} hash_alg={sig.hash_alg}"
-        )
-
-    def _handle_data_block(self, payload_size: int):
-        if payload_size < SZ_CADB_DATA_PACKAGE:
-            panic("Package DATA block payload too small", FormatError)
-        data_hdr = self.stream.read_exact(SZ_CADB_DATA_PACKAGE, "DATA block package header")
-        hdr = CAdbDataPackage.from_buffer(data_hdr)
-        data_len = payload_size - SZ_CADB_DATA_PACKAGE
-        file_info = self._file_lookup.get((hdr.path_idx, hdr.file_idx))
-        logger.info(
-            f"  [{self._blk_index}] DATA path_idx={hdr.path_idx} file_idx={hdr.file_idx} data_len={data_len}"
-        )
-        if file_info is None:
-            panic(f"Unexpected DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
-        logger.info(f"      path={file_info.path}")
-
-        key = (hdr.path_idx, hdr.file_idx)
-        if key in self._written_data:
-            panic(f"Duplicate DATA block for path_idx={hdr.path_idx} file_idx={hdr.file_idx}", FormatError)
-        self._written_data.add(key)
-
-        if file_info.kind != FileKind.FILE:
-            panic(f"DATA block points to non-regular file '{file_info.path}'", FormatError)
-        if data_len != file_info.size:
-            panic(
-                f"DATA size mismatch for '{file_info.path}': {data_len} != {file_info.size}",
-                FormatError,
-            )
-        self.tar_writer.add_data_file_stream(file_info, data_len, self.stream)
-
-    def _handle_package(self):
-        self._file_lookup = {}
-        self._written_data = set()
-
-        blk = self._read_first_adb_block_desc()
-        self._handle_adb_block(AdbSchema.PACKAGE, blk.payload_size)
-
-        blk = self._read_next_block_desc(blk.raw_size)
-        while blk is not None and blk.block_type == AdbBlockType.SIG:
-            self._handle_sig_block(blk.payload_size)
-            blk = self._read_next_block_desc(blk.raw_size)
-
-        while blk is not None and blk.block_type == AdbBlockType.DATA:
-            self._handle_data_block(blk.payload_size)
-            blk = self._read_next_block_desc(blk.raw_size)
-
-        if blk is not None:
-            if blk.block_type == AdbBlockType.ADB:
-                panic("Invalid block order: ADB block after SIG/DATA", FormatError)
-            if blk.block_type == AdbBlockType.SIG:
-                panic("Invalid block order: SIG block position", FormatError)
-            panic(f"Unknown block type {blk.block_type}", FormatError)
-
-    def run(self):
-        schema = CAdbSchema.from_buffer(
-            self.stream.read_exact(SZ_CADB_SCHEMA, "schema")
-        ).value
-
-        match schema:
-            case AdbSchema.PACKAGE:
-                logger.info("Schema: package")
-                self._handle_package()
-            case AdbSchema.INDEX:
-                panic("Schema for index is not supported yet", NotImplementedError)
+class AdbDataBlocksTar:
+    def __init__(self, path_tar: Path, paths: ApkPaths, stream: AdbStream):
+        match path_tar.name.rsplit(".", 1)[-1]:
+            case "gz":
+                mode_tar = "w:gz"
+            case "bz2":
+                mode_tar = "w:bz2"
+            case "xz":
+                mode_tar = "w:xz"
+            case "zst":
+                mode_tar = "w:zst"
             case _:
-                panic(f"Unknown schema {schema:#x}", FormatError)
+                mode_tar = "w"
+        self.path_tar = path_tar
+        self.mode_tar = mode_tar
+        self.dirs = paths.dirs
+        self.stream = stream
+        self.id_next_dir = 1
+        self.id_next_file = 1
 
-def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
+    def __enter__(self) -> Self:
+        self.tar = tarfile.open(self.path_tar, self.mode_tar) # type: ignore[arg-type]
+        # empty root dir not needed
+        if self.dirs[0].name:
+            panic(f"First directory name not empty but {self.dirs[0].name}", ApkFormatError)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        count_dirs = len(self.dirs)
+        if self.id_next_dir < count_dirs:
+            self.fill(count_dirs, len(self.dirs[-1].files) + 1)
+        elif self.id_next_dir == count_dirs:
+            count_files = len(self.dirs[-1].files)
+            if self.id_next_file <= count_files:
+                self.fill(count_dirs, count_files + 1)
+        self.tar.close()
+
+    @staticmethod
+    def update_info_from_acl(info: tarfile.TarInfo, acl: ApkAcl):
+        info.mode = acl.mode
+        info.uname = acl.user
+        info.gname = acl.group
+        match acl.user:
+            case "root":
+                info.uid = 0
+            case "nobody":
+                info.uid = 65534
+        match acl.group:
+            case "root":
+                info.gid = 0
+            case "nogroup":
+                info.gid = 65534
+        if acl.xattrs:
+            pax_headers = {}
+            for xattr in acl.xattrs:
+                try:
+                    value = xattr[1].decode("utf-8")
+                except UnicodeDecodeError:
+                    value = "hex:" + xattr[1].hex()
+                pax_headers[f"SCHILY.xattr.{xattr[0]}"] = value
+            info.pax_headers = pax_headers
+
+    def add_dir(self, directory: ApkDir):
+        logger.debug(f"{self.path_tar} <d- {directory.name}/")
+        info = tarfile.TarInfo(directory.name)
+        info.type = tarfile.DIRTYPE
+        self.update_info_from_acl(info, directory.acl)
+        self.tar.addfile(info)
+
+    def add_file_empty(self, name_dir: str, file: ApkFile):
+        name_file = f"{name_dir}/{file.name}"
+        info = tarfile.TarInfo(name_file)
+        info.size = file.size or 0
+        info.mtime = file.mtime or 0
+        self.update_info_from_acl(info, file.acl)
+        match file.kind:
+            case ApkFileKind.REGULAR:
+                if file.size and file.size > 0:
+                    panic(f"Adding a file with size {file.size} as empty file", ApkFormatError)
+                info.type = tarfile.REGTYPE
+                char_type = "f"
+            case ApkFileKind.SYMLINK:
+                info.linkname = file.target
+                info.type = tarfile.SYMTYPE
+                char_type = "l"
+            case ApkFileKind.HARDLINK:
+                info.linkname = file.target
+                info.type = tarfile.LNKTYPE
+                char_type = "L"
+            case ApkFileKind.BLOCK:
+                if file.dev is None:
+                    panic("Device block without dev number")
+                info.devmajor = file.dev.major
+                info.devminor = file.dev.minor
+                info.type = tarfile.BLKTYPE
+                char_type = "b"
+            case ApkFileKind.CHAR:
+                if file.dev is None:
+                    panic("Device char without dev number")
+                info.devmajor = file.dev.major
+                info.devminor = file.dev.minor
+                info.type = tarfile.CHRTYPE
+                char_type = "c"
+            case ApkFileKind.FIFO:
+                if file.dev is None:
+                    panic("Device fifo without dev number")
+                info.devmajor = file.dev.major
+                info.devminor = file.dev.minor
+                info.type = tarfile.FIFOTYPE
+                char_type = "p"
+            case _:
+                panic(f"Invalid File kind {file.kind}")
+        logger.debug(f"{self.path_tar} <{char_type}- {name_file}")
+        self.tar.addfile(info)
+
+    def add_file_data(self, name_dir: str, file: ApkFile):
+        name_file = f"{name_dir}/{file.name}"
+        logger.debug(f"{self.path_tar} <f- {name_file}")
+        info = tarfile.TarInfo(name_file)
+        if file.size is None:
+            panic("Adding an supposedly empty file with data")
+        info.size = file.size
+        info.mtime = file.mtime or 0
+        info.type = tarfile.REGTYPE
+        self.update_info_from_acl(info, file.acl)
+        if file.hashes.as_hex:
+            pax_headers = dict(info.pax_headers)
+            pax_headers[f"APK-TOOLS.checksum.{file.hashes.hash_type}"] = file.hashes.as_hex
+            info.pax_headers = pax_headers
+        self.tar.addfile(info, AdbStreamSlice(self.stream, file.size))
+
+    def fill(self, id_until_dir: int, id_until_file: int):
+        while self.id_next_dir < id_until_dir:
+            directory = self.dirs[self.id_next_dir - 1]
+            count_files = len(directory.files)
+            while self.id_next_file <= count_files:
+                file = directory.files[self.id_next_file - 1]
+                self.add_file_empty(directory.name, file)
+                self.id_next_file += 1
+            self.add_dir(self.dirs[self.id_next_dir])
+            self.id_next_dir += 1
+            self.id_next_file = 1
+        directory = self.dirs[id_until_dir - 1]
+        while self.id_next_file < id_until_file:
+            file = directory.files[self.id_next_file - 1]
+            self.add_file_empty(directory.name, file)
+            self.id_next_file += 1
+
+    def add(self, id_dir: int, id_file: int, size: int):
+        if id_dir > self.id_next_dir:
+            self.fill(id_dir, id_file)
+        elif id_dir == self.id_next_dir:
+            if id_file > self.id_next_file:
+                self.fill(id_dir, id_file)
+            elif id_file < self.id_next_file:
+                panic(f"Backwards in files, {id_file} < {self.id_next_file}", ApkFormatError)
+        else:
+            panic(f"Backwards in dirs, {id_dir} < {self.id_next_dir}", ApkFormatError)
+        directory = self.dirs[id_dir - 1]
+        file = directory.files[id_file - 1]
+        if file.size != size:
+            panic(f"Adding a file with mismatch recorded size {file.size} vs actual size {size}")
+        self.add_file_data(directory.name, file)
+        if id_file < len(directory.files):
+            self.id_next_file = id_file + 1
+        else:
+            if id_dir < len(self.dirs):
+                self.add_dir(self.dirs[id_dir]) # actually next
+            self.id_next_dir += 1
+            self.id_next_file = 1
+
+class AdbBlocksReader:
+    def __init__(self, stream: AdbStream):
+        self.stream = stream
+
+    def maybe_read_block(self) -> Optional[AdbBlock]:
+        type_size_bytes = self.stream.read_exact_or_none(4, "block type/size")
+        if type_size_bytes is None:
+            return None
+        type_size = _uint_from(type_size_bytes)
+        type_block_raw = type_size >> 30
+        size_raw = type_size & 0x3fffffff
+        if type_block_raw == AdbBlockType.EXT:
+            type_block = AdbBlockType(size_raw)
+            _ = self.stream.skip(4, "ext block header reserved field (u32)")
+            size_raw = _uint_from(self.stream.read_exact(8, "AdbBlock.x_size"))
+            size_header = 16
+        else:
+            type_block = AdbBlockType(type_block_raw)
+            size_header = 4
+        if size_raw < size_header:
+            panic(f"Invalid block raw size {size_raw} < {size_header}")
+        return AdbBlock(type_block, size_raw, size_raw - size_header)
+
+    def read_block(self) -> AdbBlock:
+        block = self.maybe_read_block()
+        if block is None:
+            panic("Failed to read an ADB block")
+        return block
+
+    def pad(self, size_raw: int):
+        remainder = size_raw & 7
+        if remainder:
+            self.stream.skip(8 - remainder, "ADB block padding")
+
+    def parse_package(self, path_json: Optional[Path], path_tar: Optional[Path]):
+        logger.debug("Parsing package")
+
+        block = self.read_block()
+        logger.debug(block)
+        apk_metainfo = AdbBlockAdbReader(self.stream.read_exact(block.size_payload, "ADB_BLOCK_ADB")).parse()
+        if path_json:
+            with path_json.open("w") as f:
+                json.dump(apk_metainfo.as_json_dict(), f)
+
+        self.pad(block.size_raw)
+        block = self.maybe_read_block()
+
+        while block is not None and block.type_block == AdbBlockType.SIG:
+            logger.debug(block)
+            header = self.stream.read_exact(2, "sig header")
+            hash_type = ApkHashType(_uint_from(header[1:2]))
+            match hash_type:
+                case ApkHashType.SHA1 | ApkHashType.SHA256_160:
+                    size_hash = 20
+                case ApkHashType.SHA256:
+                    size_hash = 32
+                case ApkHashType.SHA512:
+                    size_hash = 64
+                case _:
+                    size_hash = 0
+            if size_hash + 2 != block.size_payload:
+                panic(f"Hash size without header ({size_hash}) does not match whole payload {block.size_payload}")
+            if size_hash:
+                hash_hex = self.stream.read_exact(size_hash, "sig hash").hex()
+            else:
+                hash_hex = ""
+            logger.info(f"Hash {hash_type}: {hash_hex}")
+            self.pad(block.size_raw)
+            block = self.maybe_read_block()
+
+        with ExitStack() as stack:
+            if path_tar:
+                tar_handler = stack.enter_context(AdbDataBlocksTar(path_tar, apk_metainfo.paths, self.stream))
+            else:
+                tar_handler = None
+            while block is not None and block.type_block == AdbBlockType.DATA:
+                logger.debug(block)
+                id_dir = _uint_from(self.stream.read_exact(4, "path_idx"))
+                id_file = _uint_from(self.stream.read_exact(4, "file_idx"))
+                size_data = block.size_payload - 8
+                logger.debug(f"Data for dir {id_dir} fie {id_file}, size {size_data}")
+                if tar_handler is None:
+                    self.stream.skip(size_data, "ADB_BLOCK_DATA")
+                else:
+                    tar_handler.add(id_dir, id_file, size_data)
+                self.pad(block.size_raw)
+                block = self.maybe_read_block()
+
+        if block is not None:
+            panic(f"Trailing ADB_BLOCK {block.type_block} at the end of ADB blocks", ApkFormatError)
+
+def dump(path_apk: Path, path_json: Optional[Path], path_tar: Optional[Path]):
+    hint_parts = [f"Dumping APK '{args.apk}'"]
+    if path_tar is not None:
+        hint_parts.append(f"and convert to tar '{path_tar}'")
+    if path_json is not None:
+        hint_parts.append(f"and dump into to json '{path_json}'")
+    logger.info(", ".join(hint_parts))
+    del hint_parts
     with path_apk.open("rb") as f:
         header = f.read(4)
         if len(header) < 4:
             panic("File too small, meanless to dump")
         if header[0:3] != b"ADB":
-            panic(f"File header (first 3 bytes) is not b'ADB' (BE 0x616462), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}", FormatError)
+            panic(f"File header (first 3 bytes) is not b'ADB' (BE 0x616462), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}", ApkFormatError)
         match header[3]:
             case AdbCompressionWay.NONE:
                 stream = RawAdbStream(f)
@@ -1141,11 +1319,9 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
                 stream = DeflateAdbStream(f)
                 stream.lossy_assert_raw()
             case AdbCompressionWay.CUSTOM:
-                header = f.read(2)
-                if len(header) < 2:
-                    panic("Truncated custom compression spec", FormatError)
-                spec = CAdbCompressionSpec.from_buffer_copy(header)
-                match spec.alg:
+                alg = f.read(1)[0]
+                _ = f.read(1)[0]
+                match alg:
                     case AdbCompressionAlg.NONE:
                         stream = RawAdbStream(f)
                     case AdbCompressionAlg.DEFLATE:
@@ -1157,29 +1333,27 @@ def dump(path_apk: Path, path_tar: Optional[Path], path_meta: Optional[Path]):
                         stream = ZstandardAdbStream(f)
                         stream.lossy_assert_raw()
                     case _:
-                        panic(f"Invalid compression alg ID {spec.alg} (level {spec.level}) ", FormatError)
+                        panic(f"Invalid compression alg ID {alg} ", ApkFormatError)
             case _:
-                panic(f"Invalid compression magic {header[3]:x}", FormatError)
-
-        mode_tar = "w:"
-        if path_tar:
-            if path_tar.name.endswith((".gz", ".bz2", ".xz", ".zst")):
-                mode_tar += path_tar.name.rsplit(".", 1)[-1]
-        else:
-            path_tar = Path("/dev/null")
-
-        with tarfile.open(path_tar, mode_tar) as tar, (path_meta or Path("/dev/null")).open("w") as f_json: # type: ignore[arg-type]
-            meta_schemas: list[PackageSchemaMeta] = []
-            ApkDumper(stream, tar, meta_schemas).run()
-
-            meta_doc: dict[str, str | list[dict[str, object]]] = {
-                "apk": str(path_apk),
-                "schemas": [asdict(schema) for schema in meta_schemas],
-            }
-            json.dump(meta_doc, f_json, indent=2, sort_keys=True)
-            f_json.write("\n")
+                panic(f"Invalid compression magic {header[3]:x}", ApkFormatError)
+        del header
+        schema = _uint_from(stream.read_exact(4, "schema"))
+        match schema:
+            case AdbSchema.PACKAGE:
+                AdbBlocksReader(stream).parse_package(path_json, path_tar)
+            case AdbSchema.INDEX:
+                panic("Schema for index is not supported yet", NotImplementedError)
+            case _:
+                panic(f"Unknown schema {schema:#x}", ApkFormatError)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("apk", type=Path)
+    parser.add_argument("--debug", action="store_true", help="Show debug messages")
+    parser.add_argument("--json", type=Path, help="Dump the info JSON into said file")
+    parser.add_argument("--tar", type=Path, help="Convert the apk into a tar")
+    args = parser.parse_args()
+
     logging._levelToName = {
         logging.DEBUG:      '\33[37mDEBUG...\33[0m',
         logging.INFO:       '\33[36mINFO....\33[0m',
@@ -1188,13 +1362,6 @@ if __name__ == "__main__":
         logging.FATAL:      '\33[31mFATAL!!!\33[0m',
         logging.NOTSET:            '........',
     }
-    logging.basicConfig(stream=sys.stdout, format="%(levelname)s %(message)s", level=logging.INFO)
+    logging.basicConfig(stream=sys.stdout, format="%(levelname)s %(message)s", level=logging.DEBUG if args.debug else logging.INFO)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("apk", type=Path)
-    parser.add_argument("--tar", type=Path, help="Convert the apk into a tar")
-    parser.add_argument("--json", type=Path, help="Dump the info JSON into said file")
-    args = parser.parse_args()
-
-    logger.info(f"Dumping APK '{args.apk}'")
-    dump(args.apk, args.tar, args.json)
+    dump(args.apk, args.json, args.tar)
