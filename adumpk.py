@@ -473,7 +473,7 @@ class ApkScripts:
     postupgrade: bytes = b""
 
     def show(self):
-        logger.info("Scripts:")
+        lines = []
         for key in ("trigger", "preinst", "postinst", "predeinst", "postdeinst", "preupgrade", "postupgrade"):
             attr = getattr(self, key)
             if attr:
@@ -482,7 +482,10 @@ class ApkScripts:
                     peek = f"{attr[:25]} ... {attr[-25:]}"
                 else:
                     peek = f"{attr}"
-                logger.info(f"{key} ({peek}) len={len_attr}")
+                lines.append(f"{key} ({peek}) len={len_attr}")
+        logger.info(f"Scripts ({len(lines)}):")
+        for line in lines:
+            logger.info(line)
 
     def as_json_dict(self) -> dict[str, str]:
         return {
@@ -496,10 +499,20 @@ class ApkScripts:
         }
 
 @dataclass
+class ApkTriggers:
+    paths: list[str] = field(default_factory=list)
+
+    def show(self):
+        logger.info(f"Triggers ({len(self.paths)}):")
+        for path in self.paths:
+            logger.info(path)
+
+@dataclass
 class ApkMetainfo:
     pkginfo: ApkPkginfo
     paths: ApkPaths
     scripts: ApkScripts
+    triggers: ApkTriggers
 
     def as_json_dict(self) -> dict[str, Any]:
         return {
@@ -977,6 +990,11 @@ class AdbBlockAdbReader:
                     panic(f"Unexpected field {id_field} in scripts")
         return scripts
 
+    def read_triggers(self, header: AdbVal) -> ApkTriggers:
+        return ApkTriggers(
+            [self.read_text(value) for value in self.read_values(header) if value is not None]
+        )
+
     def parse(self) -> ApkMetainfo:
         root = _uint_from(self.data[4:8])
         if root == 0:
@@ -1014,7 +1032,16 @@ class AdbBlockAdbReader:
             scripts = self.read_scripts(value_scripts)
             scripts.show()
 
-        return ApkMetainfo(pkginfo, paths, scripts)
+        value_triggers = AdbVal.in_values(values_package, AdbPkgField.TRIGGERS)
+        if value_triggers is None:
+            triggers = ApkTriggers()
+        elif value_triggers.vtype != AdbValType.OBJECT:
+            panic(f"ADB triggers it not OBJECT but {value_triggers}", ApkFormatError)
+        else:
+            triggers = self.read_triggers(value_triggers)
+            triggers.show()
+
+        return ApkMetainfo(pkginfo, paths, scripts, triggers)
 
 @dataclass(frozen=True)
 class AdbBlock:
