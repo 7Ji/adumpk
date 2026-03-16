@@ -324,9 +324,9 @@ class ApkPkginfo:
             "tags": self.tags,
         }
 
-def _str_b64_from_bytes(value: bytes) -> str:
+def _str_b64_from_bytes(value: bytes | bytearray) -> str:
     if value:
-        return base64.urlsafe_b64encode(value).decode("ascii")
+        return base64.b64encode(value).decode("ascii")
     else:
         return ""
 
@@ -1283,8 +1283,8 @@ class AdbBlocksReader:
 
         while block is not None and block.type_block == AdbBlockType.SIG:
             logger.debug(block)
-            header = self.stream.read_exact(2, "sig header")
-            hash_type = ApkHashType(_uint_from(header[1:2]))
+            buffer = self.stream.read_exact(block.size_payload, "buffer for sig")
+            hash_type = ApkHashType(buffer[1])
             match hash_type:
                 case ApkHashType.SHA1 | ApkHashType.SHA256_160:
                     size_hash = 20
@@ -1293,14 +1293,11 @@ class AdbBlocksReader:
                 case ApkHashType.SHA512:
                     size_hash = 64
                 case _:
-                    size_hash = 0
-            if size_hash + 2 != block.size_payload:
-                panic(f"Hash size without header ({size_hash}) does not match whole payload {block.size_payload}")
-            if size_hash:
-                hash_hex = self.stream.read_exact(size_hash, "sig hash").hex()
-            else:
-                hash_hex = ""
-            logger.info(f"Hash {hash_type}: {hash_hex}")
+                    self.pad(block.size_raw)
+                    block = self.maybe_read_block()
+                    continue
+            logger.info(f"Hash {hash_type}, {size_hash} bytes, ID {buffer[2:18].hex()}: {_str_b64_from_bytes(buffer[18:])}")
+            del buffer
             self.pad(block.size_raw)
             block = self.maybe_read_block()
 
