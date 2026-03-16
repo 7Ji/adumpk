@@ -46,8 +46,8 @@ INFO.... build_time       :
 INFO.... installed_size   : 2747998
 INFO.... file_size        : 
 INFO.... provider_priority: 
-INFO.... depends          : ['libc', 'vim-runtime<=9.2.0-r1']
-INFO.... provides         : ['vim<=9.2.0-r1', 'vim-full-any']
+INFO.... depends          : ['libc', 'vim-runtime=9.2.0-r1']
+INFO.... provides         : ['vim=9.2.0-r1', 'vim-full-any']
 INFO.... replaces         : []
 INFO.... install_if       : []
 INFO.... recommends       : []

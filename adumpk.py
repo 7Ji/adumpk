@@ -153,46 +153,46 @@ class AdbScriptField(AdbField):
     PREUPGRADE  = 6
     POSTUPGRADE = 7
 
-class AdbVersionFlag(IntEnum):
-    EQUAL    = 0b00001 # 1 << 0
-    LESS     = 0b00010 # 1 << 1
-    GREATER  = 0b00100 # 1 << 2
-    FUZZY    = 0b01000 # 1 << 3
-    CONFLICT = 0b10000 # 1 << 4
-
 @dataclass
 class ApkDepend:
     name: str = ""
     version: str = ""
-    match: int = AdbVersionFlag.EQUAL
+    # field for match:
+    # EQUAL    = 0b00001 # 1 << 0
+    # LESS     = 0b00010 # 1 << 1
+    # GREATER  = 0b00100 # 1 << 2
+    # FUZZY    = 0b01000 # 1 << 3
+    # CONFLICT = 0b10000 # 1 << 4
+
+    match: int = 0b0001
 
     def literal(self) -> str:
         if self.version:
-            if self.match & AdbVersionFlag.CONFLICT:
-                flags = self.match & ~AdbVersionFlag.CONFLICT
+            if self.match & 0b10000:
+                flags = self.match & ~0b01111
                 conflict = "!"
             else:
                 flags = self.match
                 conflict = ""
             match flags:
-                case int(AdbVersionFlag.LESS):
+                case 0b0010:
                     sign = "<"
-                case int(AdbVersionFlag.LESS | AdbVersionFlag.EQUAL):
+                case 0b0011:
                     sign = "<="
-                case int(AdbVersionFlag.LESS | AdbVersionFlag.EQUAL | AdbVersionFlag.FUZZY):
+                case 0b1011:
                     sign = "<~"
-                case int(AdbVersionFlag.FUZZY):
+                case 0b1000:
                     sign = "~"
-                case int(AdbVersionFlag.EQUAL):
+                case 0b0001:
                     sign = "="
-                case int(AdbVersionFlag.GREATER | AdbVersionFlag.EQUAL):
+                case 0b0101:
                     sign = ">="
-                case int(AdbVersionFlag.GREATER | AdbVersionFlag.EQUAL | AdbVersionFlag.FUZZY):
+                case 0b1101:
                     sign = ">~"
-                case int(AdbVersionFlag.GREATER):
+                case 0b0100:
                     sign = ">"
                 case _:
-                    panic(f"Invalid dep flags {flags:x}")
+                    panic(f"Invalid dep flags 0b{flags:b}")
             return f"{conflict}{self.name}{sign}{self.version}"
         else:
             return self.name
