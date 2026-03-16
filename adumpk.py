@@ -181,7 +181,7 @@ class ApkDepend:
                     sign = "<="
                 case 0b1011:
                     sign = "<~"
-                case 0b1000:
+                case 0b1001:
                     sign = "~"
                 case 0b0001:
                     sign = "="
