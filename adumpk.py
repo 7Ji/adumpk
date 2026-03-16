@@ -169,7 +169,7 @@ class ApkDepend:
     def literal(self) -> str:
         if self.version:
             if self.match & 0b10000:
-                flags = self.match & ~0b01111
+                flags = self.match & 0b01111
                 conflict = "!"
             else:
                 flags = self.match
