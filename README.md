@@ -10,7 +10,7 @@ The definition of the ADB format is loosely defined by some schemas, and in most
 ## Usage
 
 ```bash
-./adumpk.py (--help/-h) (--debug) (--tar <output.tar>) (--json <output.json>) <input.apk>
+./adumpk.py (--help/-h) (--debug) (--tar <output.tar>) (--tarsum) (--json <output.json>) <input.apk>
 ```
 
 ### Examples:
@@ -25,6 +25,12 @@ To both print info, convert to tar, and create info JSON:
 
 ```bash
 ./adumpk.py /tmp/vim-full-9.2.0-r1.apk --tar /tmp/demo.tar --json /tmp/demo.json
+```
+
+To write a tar with synthetic `APK-TOOLS.checksum.*` PAX headers similar to APK v2 data tar:
+
+```bash
+./adumpk.py /tmp/vim-full-9.2.0-r1.apk --tar /tmp/demo.tar --tarsum
 ```
 
 The output on terminal would be like the following:
@@ -75,31 +81,34 @@ INFO.... predeinst (b'#!/bin/sh\n[ -s ${IPKG_INS' ... b'"vim-full"\ndefault_prer
 INFO.... postupgrade (b'#!/bin/sh\nexport PKG_UPGR' ... b'nd_user\ndefault_postinst\n') len=251
 ```
 
-The converted tar is in a similar format for APK v2 (modified tar), albeit without .PKGINFO and .SIGN files as they won't make sense:
+By default the converted tar is a simple rootfs-style tar of package contents with ownership, mode, mtime, symlink, device, and xattr information preserved where possible:
 
 ```log
 > tar -tvf /tmp/demo.tar
 drwxr-xr-x root/root         0 1970-01-01 08:00 lib/
 drwxr-xr-x root/root         0 1970-01-01 08:00 lib/apk/
 drwxr-xr-x root/root         0 1970-01-01 08:00 lib/apk/packages/
-tar: Ignoring unknown extended header keyword 'APK-TOOLS.checksum.sha256'
 -rw-r--r-- root/root        13 2026-03-06 04:05 lib/apk/packages/vim-full.conffiles
-tar: Ignoring unknown extended header keyword 'APK-TOOLS.checksum.sha256'
 -rw-r--r-- root/root        59 2026-03-06 04:05 lib/apk/packages/vim-full.list
 drwxr-xr-x root/root         0 1970-01-01 08:00 lib/upgrade/
 drwxr-xr-x root/root         0 1970-01-01 08:00 lib/upgrade/keep.d/
-tar: Ignoring unknown extended header keyword 'APK-TOOLS.checksum.sha256'
 -rw-r--r-- root/root        13 2026-03-06 04:05 lib/upgrade/keep.d/vim-full
 drwxr-xr-x root/root         0 1970-01-01 08:00 usr/
 drwxr-xr-x root/root         0 1970-01-01 08:00 usr/bin/
-tar: Ignoring unknown extended header keyword 'APK-TOOLS.checksum.sha256'
 -rwxr-xr-x root/root   2747913 2026-03-06 04:05 usr/bin/vim
 lrwxrwxrwx root/root         3 2026-03-06 04:05 usr/bin/vimdiff -> vim
 drwxr-xr-x root/root         0 1970-01-01 08:00 usr/share/vim/
 
 ```
 
-The above warning can be ignored as they're APK v2 extension; it's recommended to use libarchive/bsdtar if you want these xattr, although as they're non-standard they would not be written to filesystem anyway:
+If you pass `--tarsum`, regular files also get synthetic `APK-TOOLS.checksum.*` PAX headers similar to APK v2 data tar. GNU `tar` will warn about these non-standard headers:
+
+```log
+> tar -tvf /tmp/demo.tar
+tar: Ignoring unknown extended header keyword 'APK-TOOLS.checksum.sha256'
+```
+
+The above warning can be ignored. It's recommended to use libarchive/bsdtar if you want these xattr, although as they're non-standard they would not be written to filesystem anyway:
 
 ```log
 > sudo bsdtar --acls --xattrs -xvpf /tmp/demo.tar

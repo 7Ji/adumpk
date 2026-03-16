@@ -1064,7 +1064,7 @@ class AdbStreamSlice:
         return data
 
 class AdbDataBlocksTar:
-    def __init__(self, path_tar: Path, paths: ApkPaths, stream: AdbStream):
+    def __init__(self, path_tar: Path, paths: ApkPaths, stream: AdbStream, checksum: bool):
         match path_tar.name.rsplit(".", 1)[-1]:
             case "gz":
                 mode_tar = "w:gz"
@@ -1080,6 +1080,7 @@ class AdbDataBlocksTar:
         self.mode_tar = mode_tar
         self.dirs = paths.dirs
         self.stream = stream
+        self.checksum = checksum
         self.id_next_dir = 1
         self.id_next_file = 1
 
@@ -1188,7 +1189,7 @@ class AdbDataBlocksTar:
         info.mtime = file.mtime or 0
         info.type = tarfile.REGTYPE
         self.update_info_from_acl(info, file.acl)
-        if file.hashes.as_hex:
+        if self.checksum and file.hashes.as_hex:
             pax_headers = dict(info.pax_headers)
             pax_headers[f"APK-TOOLS.checksum.{file.hashes.hash_type}"] = file.hashes.as_hex
             info.pax_headers = pax_headers
@@ -1268,7 +1269,7 @@ class AdbBlocksReader:
         if remainder:
             self.stream.skip(8 - remainder, "ADB block padding")
 
-    def parse_package(self, path_json: Optional[Path], path_tar: Optional[Path]):
+    def parse_package(self, path_json: Optional[Path], path_tar: Optional[Path], checksum_tar: bool):
         logger.debug("Parsing package")
 
         block = self.read_block()
@@ -1303,7 +1304,7 @@ class AdbBlocksReader:
 
         with ExitStack() as stack:
             if path_tar:
-                tar_handler = stack.enter_context(AdbDataBlocksTar(path_tar, apk_metainfo.paths, self.stream))
+                tar_handler = stack.enter_context(AdbDataBlocksTar(path_tar, apk_metainfo.paths, self.stream, checksum_tar))
             else:
                 tar_handler = None
             while block is not None and block.type_block == AdbBlockType.DATA:
@@ -1322,10 +1323,12 @@ class AdbBlocksReader:
         if block is not None:
             panic(f"Trailing ADB_BLOCK {block.type_block} at the end of ADB blocks", ApkFormatError)
 
-def dump(path_apk: Path, path_json: Optional[Path], path_tar: Optional[Path]):
+def dump(path_apk: Path, path_json: Optional[Path], path_tar: Optional[Path], checksum_tar: bool):
     hint_parts = [f"Dumping APK '{args.apk}'"]
     if path_tar is not None:
         hint_parts.append(f"and convert to tar '{path_tar}'")
+        if checksum_tar:
+            hint_parts.append("with APK-TOOLS.checksum PAX headers")
     if path_json is not None:
         hint_parts.append(f"and dump into to json '{path_json}'")
     logger.info(", ".join(hint_parts))
@@ -1364,7 +1367,7 @@ def dump(path_apk: Path, path_json: Optional[Path], path_tar: Optional[Path]):
         schema = _uint_from(stream.read_exact(4, "schema"))
         match schema:
             case AdbSchema.PACKAGE:
-                AdbBlocksReader(stream).parse_package(path_json, path_tar)
+                AdbBlocksReader(stream).parse_package(path_json, path_tar, checksum_tar)
             case AdbSchema.INDEX:
                 panic("Schema for index is not supported yet", NotImplementedError)
             case _:
@@ -1376,6 +1379,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Show debug messages")
     parser.add_argument("--json", type=Path, help="Dump the info JSON into said file")
     parser.add_argument("--tar", type=Path, help="Convert the apk into a tar")
+    parser.add_argument("--tarsum", action="store_true", help="When using --tar, add APK-TOOLS.checksum.* PAX headers")
     args = parser.parse_args()
 
     logging._levelToName = {
@@ -1388,4 +1392,4 @@ if __name__ == "__main__":
     }
     logging.basicConfig(stream=sys.stdout, format="%(levelname)s %(message)s", level=logging.DEBUG if args.debug else logging.INFO)
 
-    dump(args.apk, args.json, args.tar)
+    dump(args.apk, args.json, args.tar, args.tarsum)
