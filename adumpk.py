@@ -1118,12 +1118,17 @@ class AdbDataBlocksTar:
                 info.gid = 65534
         if acl.xattrs:
             pax_headers = {}
-            for xattr in acl.xattrs:
-                try:
-                    value = xattr[1].decode("utf-8")
-                except UnicodeDecodeError:
-                    value = "hex:" + xattr[1].hex()
-                pax_headers[f"SCHILY.xattr.{xattr[0]}"] = value
+            for xattr_name, xattr_value in acl.xattrs:
+                name_pax = []
+                for byte in xattr_name.encode("utf-8"):
+                    # Keep visible ASCII (0x21-0x7e) except '%' (0x25) and '=' (0x3d), which are escaped as %XX.
+                    if 0x21 <= byte <= 0x7e and byte not in (0x25, 0x3d):
+                        name_pax.append(chr(byte))
+                    else:
+                        name_pax.append(f"%{byte:02X}")
+                # Preserve arbitrary xattr bytes losslessly through pax BINARY mode.
+                value_pax = bytes(xattr_value).decode("utf-8", "surrogateescape")
+                pax_headers[f"SCHILY.xattr.{''.join(name_pax)}"] = value_pax
             info.pax_headers = pax_headers
 
     def add_dir(self, directory: ApkDir):
