@@ -1138,6 +1138,13 @@ class ApkRootTarWriter:
         self.update_info_from_acl(info, directory.acl)
         self.tar.addfile(info)
 
+    @staticmethod
+    def set_info_dev_number(info: tarfile.TarInfo, dev: Optional[ApkDev]):
+        if dev is None:
+            panic("Device without dev number")
+        info.devmajor = dev.major
+        info.devminor = dev.minor
+
     def add_file_empty(self, name_dir: str, file: ApkFile):
         name_file = f"{name_dir}/{file.name}"
         info = tarfile.TarInfo(name_file)
@@ -1159,24 +1166,15 @@ class ApkRootTarWriter:
                 info.type = tarfile.LNKTYPE
                 char_type = "L"
             case ApkFileKind.BLOCK:
-                if file.dev is None:
-                    panic("Device block without dev number")
-                info.devmajor = file.dev.major
-                info.devminor = file.dev.minor
+                self.set_info_dev_number(info, file.dev)
                 info.type = tarfile.BLKTYPE
                 char_type = "b"
             case ApkFileKind.CHAR:
-                if file.dev is None:
-                    panic("Device char without dev number")
-                info.devmajor = file.dev.major
-                info.devminor = file.dev.minor
+                self.set_info_dev_number(info, file.dev)
                 info.type = tarfile.CHRTYPE
                 char_type = "c"
             case ApkFileKind.FIFO:
-                if file.dev is None:
-                    panic("Device fifo without dev number")
-                info.devmajor = file.dev.major
-                info.devminor = file.dev.minor
+                self.set_info_dev_number(info, file.dev)
                 info.type = tarfile.FIFOTYPE
                 char_type = "p"
             case _:
