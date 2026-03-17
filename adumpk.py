@@ -1063,7 +1063,7 @@ class AdbStreamSlice:
         self.remain -= len(data)
         return data
 
-class AdbDataBlocksTar:
+class ApkRootTarWriter:
     def __init__(self, path_tar: Path, paths: ApkPaths, stream: AdbStream, checksum: bool):
         match path_tar.name.rsplit(".", 1)[-1]:
             case "gz":
@@ -1309,7 +1309,7 @@ class AdbBlocksReader:
 
         with ExitStack() as stack:
             if path_tar:
-                tar_handler = stack.enter_context(AdbDataBlocksTar(path_tar, apk_metainfo.paths, self.stream, checksum_tar))
+                tar_handler = stack.enter_context(ApkRootTarWriter(path_tar, apk_metainfo.paths, self.stream, checksum_tar))
             else:
                 tar_handler = None
             while block is not None and block.type_block == AdbBlockType.DATA:
