@@ -18,7 +18,7 @@ import stat
 import sys
 import tarfile
 import time
-from typing import Any, BinaryIO, NoReturn, Optional, Self, Sequence, Type, Union
+from typing import Any, BinaryIO, Literal, NoReturn, Optional, Self, Sequence, Type, Union
 import zlib
 
 logger = logging.getLogger(__name__)
@@ -1054,30 +1054,30 @@ class AdbStreamSlice:
         self.stream = stream
         self.remain = size
 
-    def read(self, size: int = -1) -> bytes | bytearray:
+    def read(self, size: int = -1) -> bytes:
         if self.remain <= 0:
             return b""
         if size < 0 or size > self.remain:
             size = self.remain
         data = self.stream.read_exact(size, "slice")
         self.remain -= len(data)
-        return data
+        return bytes(data)
 
 class ApkRootTarWriter:
     def __init__(self, path_tar: Path, paths: ApkPaths, stream: AdbStream, checksum: bool):
-        match path_tar.name.rsplit(".", 1)[-1]:
-            case "gz":
-                mode_tar = "w:gz"
-            case "bz2":
-                mode_tar = "w:bz2"
-            case "xz":
-                mode_tar = "w:xz"
-            case "zst":
-                mode_tar = "w:zst"
-            case _:
-                mode_tar = "w"
         self.path_tar = path_tar
-        self.mode_tar = mode_tar
+        mode_tar = "w"
+        if "." in path_tar.name:
+            match path_tar.name.rsplit(".", 1)[-1]:
+                case "gz":
+                    mode_tar += ":gz"
+                case "bz2":
+                    mode_tar += ":bz2"
+                case "xz":
+                    mode_tar += ":xz"
+                case "zst":
+                    mode_tar += ":zst"
+        self.mode_tar: Literal["w", "w:gz", "w:bz2", "w:xz", "w:zst"] = mode_tar
         self.dirs = paths.dirs
         self.stream = stream
         self.checksum = checksum
@@ -1085,7 +1085,7 @@ class ApkRootTarWriter:
         self.id_next_file = 1
 
     def __enter__(self) -> Self:
-        self.tar = tarfile.open(self.path_tar, self.mode_tar) # type: ignore[arg-type]
+        self.tar = tarfile.open(self.path_tar, self.mode_tar)
         # empty root dir not needed
         if self.dirs[0].name:
             panic(f"First directory name not empty but {self.dirs[0].name}", ApkFormatError)
