@@ -519,6 +519,7 @@ class ApkMetainfo:
             "pkginfo": self.pkginfo.as_json_dict(),
             "paths": [d.as_json_dict() for d in self.paths.dirs],
             "scripts": self.scripts.as_json_dict(),
+            "triggers": self.triggers.paths
         }
 
 SZ_CHUNK = 1024 * 1024 # 1 MiB
