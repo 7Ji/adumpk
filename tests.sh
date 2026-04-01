@@ -4,6 +4,11 @@ set -euo pipefail
 # On actual tests, this shall be set in environment to e.g. a local squid instance
 MIRROR_OPENWRT="${MIRROR_OPENWRT:-https://downloads.openwrt.org}"
 
+if [[ -z "${DIR_WORK:-}" ]]; then
+    DIR_WORK=$(mktemp -d "${TMPDIR:-/tmp}/adumpkTests.XXXXXXX")
+    trap "rm -rf ${DIR_WORK}" EXIT INT TERM KILL
+fi
+
 declare -A TESTS_DONE=()
 
 do_test() { # $1: name
@@ -109,9 +114,6 @@ test_apk_tar() {
     tar -tvf "${TAR_NGINX}" 2>"${ERR}"
     [[ -s "${ERR}" ]]
 }
-
-DIR_WORK=$(mktemp -d "${TMPDIR:-/tmp}/adumpkTests.XXXXXXX")
-trap "rm -rf ${DIR_WORK}" EXIT INT TERM KILL
 
 if [[ "$#" -gt 0 ]]; then
     for TEST in "$@"; do
