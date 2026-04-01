@@ -62,51 +62,36 @@ test_index_integrity() {
     echo "${INFO_NGINX}"
     local VERSION_NGINX=$(echo "${INFO_NGINX}" | jq -r '."version"')
     local SIZE_NGINX=$(echo "${INFO_NGINX}" | jq -r '."file-size"')
-    # local ALGORITHM_NGINX=$(echo "${INFO_NGINX}" | jq -r '."checksum"."type"')
-    # local HASH_NGINX=$(echo "${INFO_NGINX}" | jq -r '."checksum"."value"')
-    # echo "Downloading the package to check integrity, version ${VERSION_NGINX}, size ${SIZE_NGINX}, ${ALGORITHM_NGINX}sum == ${HASH_NGINX}"
-    echo "Downloading the package to check integrity, version ${VERSION_NGINX}, size ${SIZE_NGINX}"
+    local ALGORITHM_NGINX=$(echo "${INFO_NGINX}" | jq -r '."checksum"."type"')
+    local HASH_NGINX=$(echo "${INFO_NGINX}" | jq -r '."checksum"."value"')
+    echo "Downloading the package to check integrity, version ${VERSION_NGINX}, size ${SIZE_NGINX}, checksum(${ALGORITHM_NGINX}) = ${HASH_NGINX}"
     APK_NGINX="${DIR_WORK}/nginx-full.apk"
     curl -o "${APK_NGINX}" "${PREFIX_URL_OPENWRT}/nginx-full-${VERSION_NGINX}.apk"
     local SIZE_NGINX_ACTUAL=$(stat -c '%s' "${APK_NGINX}")
-    # local BAD=''
+    local BAD=''
     if [[ "${SIZE_NGINX}" != "${SIZE_NGINX_ACTUAL}" ]]; then
         echo "Size of nginx-full pacakge is ${SIZE_NGINX_ACTUAL}, differing from ${SIZE_NGINX} recorded in index"
-        return 1
-        # BAD=1
+        BAD=1
     fi
-    echo "Checking if adumpk.py considers it a valid apk"
-    ./adumpk.py --log fatal "${APK_NGINX}"
-    # return
-    # case "${ALGORITHM_NGINX}" in
-    # sha1|sha256|sha512)
-    #     local HASH_NGINX_ACTUAL=$("${ALGORITHM_NGINX}sum" "${FILE_NGINX}")
-    #     HASH_NGINX_ACTUAL="${HASH_NGINX_ACTUAL%% *}"
-    #     if [[ "${HASH_NGINX}" != "${HASH_NGINX_ACTUAL}" ]]; then
-    #         echo "${ALGORITHM_NGINX}sum of nginx-full.apk differ, expected ${HASH_NGINX}, actual ${HASH_NGINX_ACTUAL}"
-    #         BAD=1
-    #     fi
-    #     ./adumpk.py "${FILE_NGINX}"
-    #     ;;
-    # *)
-    #     echo "Unknown Hash algorithm ${ALGORITHM_NGINX}, only sha1/sha256/sha512 are supported"
-    #     BAD=1
-    #     ;;
-    # esac
-    # [[ -z "${BAD}" ]]
-}
-
-test_apk_json() {
-    do_test_silent index_integrity
     JSON_NGINX="${DIR_WORK}/nginx-full.json"
+    echo "Dumping JSON info for actual package"
     ./adumpk.py --log fatal --json "${JSON_NGINX}" "${APK_NGINX}"
     echo "Peek into dumped json:"
     head -c 50 "${JSON_NGINX}"
     echo
+    local HASH_NGINX_ACTUAL
+    HASH_NGINX_ACTUAL=$(jq -r '."identity"."'"${ALGORITHM_NGINX}"'"' "${JSON_NGINX}")
+    if [[ "${HASH_NGINX}" != "${HASH_NGINX_ACTUAL}" ]]; then
+        echo "${ALGORITHM_NGINX} identity hash of nginx-full differs, expected ${HASH_NGINX}, actual ${HASH_NGINX_ACTUAL}"
+        BAD=1
+    fi
+    echo "Checking if adumpk.py considers it a valid apk"
+    ./adumpk.py --log fatal "${APK_NGINX}"
+    [[ -z "${BAD}" ]]
 }
 
 test_apk_tar() {
-    do_test_silent apk_json
+    do_test_silent index_integrity
     TAR_NGINX="${DIR_WORK}/nginx-full.tar"
     ./adumpk.py --log fatal --tar "${TAR_NGINX}" --tarsum "${APK_NGINX}"
     local ERR="${DIR_WORK}/nginx-full.tar.err"
@@ -120,7 +105,7 @@ if [[ "$#" -gt 0 ]]; then
         do_test "${TEST}"
     done
 else
-    for TEST in index_json index_integrity apk_json apk_tar; do
+    for TEST in index_json index_integrity apk_tar; do
         do_test "${TEST}"
     done
 fi

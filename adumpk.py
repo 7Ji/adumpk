@@ -9,6 +9,7 @@ except ModuleNotFoundError:
     zstd = None
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
+import hashlib
 import io
 import json
 import logging
@@ -243,6 +244,35 @@ class ApkHash:
         return {
             "type": str(self.hash_type),
             "value": self.as_hex
+        }
+
+@dataclass
+class ApkIdentity:
+    sha1: bytes = b""
+    sha256_160: bytes = b""
+    sha256: bytes = b""
+    sha512: bytes = b""
+
+    @classmethod
+    def from_adb_block(cls, data: bytes | bytearray) -> Self:
+        sha1 = hashlib.sha1(data).digest()
+        sha256 = hashlib.sha256(data).digest()
+        sha512 = hashlib.sha512(data).digest()
+        return cls(sha1, sha256[:20], sha256, sha512)
+
+    def show(self):
+        logger.info("Identity calculated:")
+        logger.info(f"  sha1 = {self.sha1.hex()}")
+        logger.info(f"  sha256_160 = {self.sha256_160.hex()}")
+        logger.info(f"  sha256 = {self.sha256.hex()}")
+        logger.info(f"  sha512 = {self.sha512.hex()}")
+
+    def as_json_dict(self) -> dict[str, str]:
+        return {
+            "sha256": self.sha256.hex(),
+            "sha256_160": self.sha256_160.hex(),
+            "sha512": self.sha512.hex(),
+            "sha1": self.sha1.hex(),
         }
 
 def _str_from_optional_int(value: Optional[int]):
@@ -514,6 +544,7 @@ class ApkTriggers:
 
 @dataclass
 class ApkMetainfo:
+    identity: ApkIdentity
     pkginfo: AdbPkginfo
     paths: ApkPaths
     scripts: ApkScripts
@@ -521,6 +552,7 @@ class ApkMetainfo:
 
     def as_json_dict(self) -> dict[str, Any]:
         return {
+            "identity": self.identity.as_json_dict(),
             "pkginfo": self.pkginfo.as_json_dict(),
             "paths": [d.as_json_dict() for d in self.paths.dirs],
             "scripts": self.scripts.as_json_dict(),
@@ -1040,6 +1072,8 @@ class AdbBlockAdbReader:
 
     def parse_apk(self) -> ApkMetainfo:
         values = self.read_values_root()
+        identity = ApkIdentity.from_adb_block(self.data)
+        identity.show()
 
         value = AdbVal.in_values(values, AdbPkgField.PKGINFO)
         if value is None:
@@ -1076,7 +1110,7 @@ class AdbBlockAdbReader:
             triggers = self.read_triggers(value)
             triggers.show()
 
-        return ApkMetainfo(pkginfo, paths, scripts, triggers)
+        return ApkMetainfo(identity, pkginfo, paths, scripts, triggers)
 
     def parse_index(self):
         values = self.read_values_root()
