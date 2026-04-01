@@ -23,7 +23,7 @@ import zlib
 
 logger = logging.getLogger(__name__)
 
-class ApkFormatError(ValueError):
+class AdbFormatError(ValueError):
     pass
 
 def panic(msg: str, etype: Type[Exception] = ValueError) -> NoReturn:
@@ -87,6 +87,11 @@ class AdbFileField(AdbField):
     MTIME  = 4
     HASHES = 5
     TARGET = 6
+
+class AdbIndexField(AdbField):
+    DESCRIPTION	    = 1
+    PACKAGES	    = 2
+    PKGNAME_SPEC    = 3
 
 class AdbPkgField(AdbField):
     PKGINFO  = 1
@@ -231,7 +236,7 @@ class ApkHash:
             case 64:
                 hash_type = ApkHashType.SHA512
             case _:
-                panic(f"Unknown hash with length {len_hash}", ApkFormatError)
+                panic(f"Unknown hash with length {len_hash}", AdbFormatError)
         return cls(hash_type, bytes(raw), raw.hex())
 
     def as_json_dict(self) -> dict[str, str]:
@@ -247,7 +252,7 @@ def _str_from_optional_int(value: Optional[int]):
         return str(value)
 
 @dataclass
-class ApkPkginfo:
+class AdbPkginfo:
     name: str = ""
     version: str = ""
     hashes: ApkHash = field(default_factory=ApkHash)
@@ -509,7 +514,7 @@ class ApkTriggers:
 
 @dataclass
 class ApkMetainfo:
-    pkginfo: ApkPkginfo
+    pkginfo: AdbPkginfo
     paths: ApkPaths
     scripts: ApkScripts
     triggers: ApkTriggers
@@ -520,6 +525,27 @@ class ApkMetainfo:
             "paths": [d.as_json_dict() for d in self.paths.dirs],
             "scripts": self.scripts.as_json_dict(),
             "triggers": self.triggers.paths
+        }
+
+@dataclass
+class AdbIndexPackages:
+    packages: list[AdbPkginfo] = field(default_factory=list)
+
+    def show(self):
+        logger.info(f"Packages ({len(self.packages)}):")
+        line = "=" * 80
+        logger.info(line)
+        for package in self.packages:
+            package.show()
+            logger.info(line)
+
+@dataclass
+class AdbIndex:
+    packages: AdbIndexPackages
+
+    def as_json_dict(self) -> dict[str, Any]:
+        return {
+            "packages": {package.name: package.as_json_dict() for package in self.packages.packages}
         }
 
 SZ_CHUNK = 1024 * 1024 # 1 MiB
@@ -534,7 +560,7 @@ class AdbStream(ABC):
         while True:
             chunk = self.read(size - len_out)
             if not chunk:
-                panic(f"Truncated {what}", ApkFormatError)
+                panic(f"Truncated {what}", AdbFormatError)
             out.extend(chunk)
             len_out = len(out)
             if len_out == size:
@@ -560,13 +586,13 @@ class AdbStream(ABC):
         while remaining > 0:
             chunk = self.read(min(remaining, SZ_CHUNK))
             if not chunk:
-                panic(f"Truncated {what}", ApkFormatError)
+                panic(f"Truncated {what}", AdbFormatError)
             remaining -= len(chunk)
 
     def lossy_assert_raw(self):
         header = self.read_exact(4, "raw header")
         if header != b"ADB.":
-            panic(f"Inner raw stream is not b'ADB.' (BE 0x6164622E), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}{header[3]:x}", ApkFormatError)
+            panic(f"Inner raw stream is not b'ADB.' (BE 0x6164622E), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}{header[3]:x}", AdbFormatError)
 
 class RawAdbStream(AdbStream):
     __slots__ = ("_file")
@@ -679,7 +705,7 @@ class ZstandardAdbStream(AdbStream):
             if self._decompressor.needs_input:
                 in_chunk = self._file.read(SZ_CHUNK)
                 if not in_chunk:
-                    panic("Truncated zstd stream", ApkFormatError)
+                    panic("Truncated zstd stream", AdbFormatError)
             else:
                 in_chunk = b""
 
@@ -687,7 +713,7 @@ class ZstandardAdbStream(AdbStream):
             if out_chunk:
                 self._buffer.write(out_chunk)
             elif self._decompressor.needs_input and not in_chunk:
-                panic("Truncated zstd stream", ApkFormatError)
+                panic("Truncated zstd stream", AdbFormatError)
 
             if self._decompressor.eof:
                 self._eof = True
@@ -786,7 +812,7 @@ class AdbBlockAdbReader:
 
     def read_values(self, header: AdbVal) -> list[Optional[AdbVal]]:
         if header.vtype != AdbValType.ARRAY and header.vtype != AdbValType.OBJECT:
-            panic(f"Expected object/array value, got type {header.vtype:#x}", ApkFormatError)
+            panic(f"Expected object/array value, got type {header.vtype:#x}", AdbFormatError)
         count = self.u32_at(header.value)
         return [AdbVal.maybe_init(self.u32_at(header.value + i * 4)) for i in range(1, count)]
 
@@ -810,8 +836,8 @@ class AdbBlockAdbReader:
     def read_depends(self, header: AdbVal) -> list[ApkDepend]:
         return [self.read_depend(value) for value in self.read_values(header) if value is not None]
 
-    def read_pkginfo(self, header: AdbVal) -> ApkPkginfo:
-        info = ApkPkginfo()
+    def read_pkginfo(self, header: AdbVal) -> AdbPkginfo:
+        info = AdbPkginfo()
         for id_value, value in enumerate(self.read_values(header), 1):
             if value is None:
                 continue
@@ -879,9 +905,9 @@ class AdbBlockAdbReader:
                 case AdbAclField.XATTRS:
                     for id_sub, sub_value in enumerate(self.read_values(value), 1):
                         if sub_value is None:
-                            panic(f"Empty XATTR entry (ID {id_sub}) not allowed", ApkFormatError)
+                            panic(f"Empty XATTR entry (ID {id_sub}) not allowed", AdbFormatError)
                         if sub_value.vtype != AdbValType.BLOB8:
-                            panic(f"XATTR entry is not BLOB8 but {sub_value.vtype}", ApkFormatError)
+                            panic(f"XATTR entry is not BLOB8 but {sub_value.vtype}", AdbFormatError)
                         parts = self.read_blob(sub_value).split(b"\x00", 1)
                         if len(parts) != 2:
                             panic(f"XATTR entry does not have NULL byte as sep")
@@ -925,10 +951,10 @@ class AdbBlockAdbReader:
                             file.kind = ApkFileKind.FIFO
                             is_dev = True
                         case _:
-                            panic(f"Invalid file type {file_ifmt:x} for special file {file.name}", ApkFormatError)
+                            panic(f"Invalid file type {file_ifmt:x} for special file {file.name}", AdbFormatError)
                     if is_dev:
                         if len(target) != 10:
-                            panic(f"Invalid device/fifo target blob length for special file {file.name}", ApkFormatError)
+                            panic(f"Invalid device/fifo target blob length for special file {file.name}", AdbFormatError)
                         file.dev = ApkDev.from_raw(_uint_from(target[2:10]))
                     else:
                         file.target = target[2:].decode("utf-8")
@@ -948,9 +974,9 @@ class AdbBlockAdbReader:
                 case AdbDirField.FILES:
                     for id_sub, sub_value in enumerate(self.read_values(value), 1):
                         if sub_value is None:
-                            panic(f"Empty FILE entry (ID {id_sub}) not allowed", ApkFormatError)
+                            panic(f"Empty FILE entry (ID {id_sub}) not allowed", AdbFormatError)
                         if sub_value.vtype != AdbValType.OBJECT:
-                            panic(f"FILE entry is not OBJECT but {sub_value.vtype}", ApkFormatError)
+                            panic(f"FILE entry is not OBJECT but {sub_value.vtype}", AdbFormatError)
                         directory.files.append(self.read_file(sub_value))
                 case _:
                     panic(f"Unexpected field {id_field} in dir")
@@ -960,7 +986,7 @@ class AdbBlockAdbReader:
         paths = ApkPaths()
         for id_value, value in enumerate(self.read_values(header), 1):
             if value is None:
-                panic(f"Empty PATHS entry (ID {id_value}) not allowed", ApkFormatError)
+                panic(f"Empty PATHS entry (ID {id_value}) not allowed", AdbFormatError)
             if AdbValType.OBJECT != value.vtype:
                 panic(f"ADB PATHS entry should be OBJECT, but it was {value.vtype} instead")
             paths.dirs.append(self.read_dir(value))
@@ -996,53 +1022,92 @@ class AdbBlockAdbReader:
             [self.read_text(value) for value in self.read_values(header) if value is not None]
         )
 
-    def parse(self) -> ApkMetainfo:
+    def read_index_packages(self, header: AdbVal) -> AdbIndexPackages:
+        return AdbIndexPackages(
+            [self.read_pkginfo(value) for value in self.read_values(header) if value is not None]
+        )
+
+    def read_values_root(self) -> list[Optional[AdbVal]]:
         root = _uint_from(self.data[4:8])
         if root == 0:
             panic("ADB has a root field with 0, the whole package shall be omitted")
 
         value_root = AdbVal.from_int(root)
         if value_root.vtype != AdbValType.OBJECT:
-            panic(f"ADB root is not OBJECT but {value_root.vtype}", ApkFormatError)
+            panic(f"ADB root is not OBJECT but {value_root.vtype}", AdbFormatError)
 
-        values_package = self.read_values(value_root)
+        return self.read_values(value_root)
 
-        value_pkginfo = AdbVal.in_values(values_package, AdbPkgField.PKGINFO)
-        if value_pkginfo is None:
-            panic(f"ADB pkginfo does not exist, which is not allowed", ApkFormatError)
-        elif value_pkginfo.vtype != AdbValType.OBJECT:
-            panic(f"ADB pkginfo is not OBJECT but {value_pkginfo.vtype}", ApkFormatError)
-        pkginfo = self.read_pkginfo(value_pkginfo)
+    def parse_apk(self) -> ApkMetainfo:
+        values = self.read_values_root()
+
+        value = AdbVal.in_values(values, AdbPkgField.PKGINFO)
+        if value is None:
+            panic(f"ADB pkginfo does not exist, which is not allowed", AdbFormatError)
+        elif value.vtype != AdbValType.OBJECT:
+            panic(f"ADB pkginfo is not OBJECT but {value.vtype}", AdbFormatError)
+        pkginfo = self.read_pkginfo(value)
         pkginfo.show()
 
-        value_paths = AdbVal.in_values(values_package, AdbPkgField.PATHS)
-        if value_paths is None:
+        value = AdbVal.in_values(values, AdbPkgField.PATHS)
+        if value is None:
             paths = ApkPaths()
-        elif value_paths.vtype != AdbValType.OBJECT:
-            panic(f"ADB paths is not OBJECT but {value_paths.vtype}", ApkFormatError)
+        elif value.vtype != AdbValType.OBJECT:
+            panic(f"ADB paths is not OBJECT but {value.vtype}", AdbFormatError)
         else:
-            paths = self.read_paths(value_paths)
+            paths = self.read_paths(value)
             paths.show()
 
-        value_scripts = AdbVal.in_values(values_package, AdbPkgField.SCRIPTS)
-        if value_scripts is None:
+        value = AdbVal.in_values(values, AdbPkgField.SCRIPTS)
+        if value is None:
             scripts = ApkScripts()
-        elif value_scripts.vtype != AdbValType.OBJECT:
-            panic(f"ADB scripts is not OBJECT but {value_scripts}", ApkFormatError)
+        elif value.vtype != AdbValType.OBJECT:
+            panic(f"ADB scripts is not OBJECT but {value.vtype}", AdbFormatError)
         else:
-            scripts = self.read_scripts(value_scripts)
+            scripts = self.read_scripts(value)
             scripts.show()
 
-        value_triggers = AdbVal.in_values(values_package, AdbPkgField.TRIGGERS)
-        if value_triggers is None:
+        value = AdbVal.in_values(values, AdbPkgField.TRIGGERS)
+        if value is None:
             triggers = ApkTriggers()
-        elif value_triggers.vtype != AdbValType.OBJECT:
-            panic(f"ADB triggers it not OBJECT but {value_triggers}", ApkFormatError)
+        elif value.vtype != AdbValType.OBJECT:
+            panic(f"ADB triggers it not OBJECT but {value.vtype}", AdbFormatError)
         else:
-            triggers = self.read_triggers(value_triggers)
+            triggers = self.read_triggers(value)
             triggers.show()
 
         return ApkMetainfo(pkginfo, paths, scripts, triggers)
+
+    def parse_index(self):
+        values = self.read_values_root()
+
+        value = AdbVal.in_values(values, AdbIndexField.DESCRIPTION)
+        if value is None:
+            pass
+        elif value.vtype != AdbValType.OBJECT:
+            panic(f"ADB description is not OBJECT but {value.vtype}", AdbFormatError)
+        else:
+            pass
+
+        value = AdbVal.in_values(values, AdbIndexField.PACKAGES)
+        if value is None:
+            packages = AdbIndexPackages()
+        elif value.vtype != AdbValType.OBJECT:
+            panic(f"ADB packages is not OBJECT but {value.vtype}", AdbFormatError)
+        else:
+            packages = self.read_index_packages(value)
+        packages.show()
+
+        value = AdbVal.in_values(values, AdbIndexField.PKGNAME_SPEC)
+        if value is None:
+            pass
+        elif value.vtype != AdbValType.OBJECT:
+            panic(f"ADB pkgname spec is not OBJECT but {value.vtype}", AdbFormatError)
+        else:
+            pass
+
+        return AdbIndex(packages)
+
 
 @dataclass(frozen=True)
 class AdbBlock:
@@ -1089,7 +1154,7 @@ class ApkRootTarWriter:
         self.tar = tarfile.open(self.path_tar, self.mode_tar)
         # empty root dir not needed
         if self.dirs[0].name:
-            panic(f"First directory name not empty but {self.dirs[0].name}", ApkFormatError)
+            panic(f"First directory name not empty but {self.dirs[0].name}", AdbFormatError)
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -1155,7 +1220,7 @@ class ApkRootTarWriter:
         match file.kind:
             case ApkFileKind.REGULAR:
                 if file.size and file.size > 0:
-                    panic(f"Adding a file with size {file.size} as empty file", ApkFormatError)
+                    panic(f"Adding a file with size {file.size} as empty file", AdbFormatError)
                 info.type = tarfile.REGTYPE
                 char_type = "f"
             case ApkFileKind.SYMLINK:
@@ -1223,9 +1288,9 @@ class ApkRootTarWriter:
             if id_file > self.id_next_file:
                 self.fill(id_dir, id_file)
             elif id_file < self.id_next_file:
-                panic(f"Backwards in files, {id_file} < {self.id_next_file}", ApkFormatError)
+                panic(f"Backwards in files, {id_file} < {self.id_next_file}", AdbFormatError)
         else:
-            panic(f"Backwards in dirs, {id_dir} < {self.id_next_dir}", ApkFormatError)
+            panic(f"Backwards in dirs, {id_dir} < {self.id_next_dir}", AdbFormatError)
         directory = self.dirs[id_dir - 1]
         file = directory.files[id_file - 1]
         if file.size != size:
@@ -1278,7 +1343,7 @@ class AdbBlocksReader:
 
         block = self.read_block()
         logger.debug(block)
-        apk_metainfo = AdbBlockAdbReader(self.stream.read_exact(block.size_payload, "ADB_BLOCK_ADB")).parse()
+        apk_metainfo = AdbBlockAdbReader(self.stream.read_exact(block.size_payload, "ADB_BLOCK_ADB")).parse_apk()
         if path_json:
             with path_json.open("w") as f:
                 json.dump(apk_metainfo.as_json_dict(), f)
@@ -1325,24 +1390,23 @@ class AdbBlocksReader:
                 block = self.maybe_read_block()
 
         if block is not None:
-            panic(f"Trailing ADB_BLOCK {block.type_block} at the end of ADB blocks", ApkFormatError)
+            panic(f"Trailing ADB_BLOCK {block.type_block} at the end of ADB blocks", AdbFormatError)
 
-def dump(path_apk: Path, path_json: Optional[Path], path_tar: Optional[Path], checksum_tar: bool):
-    hint_parts = [f"Dumping APK '{args.apk}'"]
-    if path_tar is not None:
-        hint_parts.append(f"and convert to tar '{path_tar}'")
-        if checksum_tar:
-            hint_parts.append("with APK-TOOLS.checksum PAX headers")
-    if path_json is not None:
-        hint_parts.append(f"and dump into to json '{path_json}'")
-    logger.info(", ".join(hint_parts))
-    del hint_parts
-    with path_apk.open("rb") as f:
+    def parse_index(self, path_json: Optional[Path]):
+        block = self.read_block()
+        logger.debug(block)
+        index = AdbBlockAdbReader(self.stream.read_exact(block.size_payload, "ADB_BLOCK_ADB")).parse_index()
+        if path_json:
+            with path_json.open("w") as f:
+                json.dump(index.as_json_dict(), f)
+
+def dump(path_adb: Path, path_json: Optional[Path], path_tar: Optional[Path], checksum_tar: bool):
+    with path_adb.open("rb") as f:
         header = f.read(4)
         if len(header) < 4:
             panic("File too small, meanless to dump")
         if header[0:3] != b"ADB":
-            panic(f"File header (first 3 bytes) is not b'ADB' (BE 0x616462), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}", ApkFormatError)
+            panic(f"File header (first 3 bytes) is not b'ADB' (BE 0x616462), but BE 0x{header[0]:x}{header[1]:x}{header[2]:x}", AdbFormatError)
         match header[3]:
             case AdbCompressionWay.NONE:
                 stream = RawAdbStream(f)
@@ -1364,23 +1428,25 @@ def dump(path_apk: Path, path_json: Optional[Path], path_tar: Optional[Path], ch
                         stream = ZstandardAdbStream(f)
                         stream.lossy_assert_raw()
                     case _:
-                        panic(f"Invalid compression alg ID {alg} ", ApkFormatError)
+                        panic(f"Invalid compression alg ID {alg} ", AdbFormatError)
             case _:
-                panic(f"Invalid compression magic {header[3]:x}", ApkFormatError)
+                panic(f"Invalid compression magic {header[3]:x}", AdbFormatError)
         del header
         schema = _uint_from(stream.read_exact(4, "schema"))
         match schema:
             case AdbSchema.PACKAGE:
+                logger.info(f"Dumping APK {path_adb}; json: {path_json}; tar: {path_tar} (checksum: {checksum_tar})")
                 AdbBlocksReader(stream).parse_package(path_json, path_tar, checksum_tar)
             case AdbSchema.INDEX:
-                panic("Schema for index is not supported yet", NotImplementedError)
+                logger.info(f"Dumping Index {path_adb}; json: {path_json}")
+                AdbBlocksReader(stream).parse_index(path_json)
             case _:
-                panic(f"Unknown schema {schema:#x}", ApkFormatError)
+                panic(f"Unknown schema {schema:#x}", AdbFormatError)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("apk", type=Path)
-    parser.add_argument("--debug", action="store_true", help="Show debug messages")
+    parser.add_argument("adb", type=Path, help="Either .apk or index .adb")
+    parser.add_argument("--log", metavar="level", choices=("DEBUG", "INFO", "WARNING", "ERROR", "FATAL", "CRITICAL"), type=str.upper, default="INFO")
     parser.add_argument("--json", type=Path, help="Dump the info JSON into said file")
     parser.add_argument("--tar", type=Path, help="Convert the apk into a tar")
     parser.add_argument("--tarsum", action="store_true", help="When using --tar, add APK-TOOLS.checksum.* PAX headers")
@@ -1394,6 +1460,6 @@ if __name__ == "__main__":
         logging.FATAL:      '\33[31mFATAL!!!\33[0m',
         logging.NOTSET:            '........',
     }
-    logging.basicConfig(stream=sys.stdout, format="%(levelname)s %(message)s", level=logging.DEBUG if args.debug else logging.INFO)
+    logging.basicConfig(stream=sys.stdout, format="%(levelname)s %(message)s", level=args.log)
 
-    dump(args.apk, args.json, args.tar, args.tarsum)
+    dump(args.adb, args.json, args.tar, args.tarsum)
