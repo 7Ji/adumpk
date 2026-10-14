@@ -657,7 +657,7 @@ class _RingBuffer:
             new_capacity *= 2
         new_buffer = bytearray(new_capacity)
         if self._size > 0:
-            size_first = min(self._size, new_capacity - self._head)
+            size_first = min(self._size, len(self._buffer) - self._head)
             new_buffer[0:size_first] = self._buffer[self._head:self._head+size_first]
             size_second = self._size - size_first
             if size_second > 0:
